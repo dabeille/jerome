@@ -1,0 +1,14 @@
+# All packages below ship prebuilt aarch64 wheels — nothing compiles on a
+# Raspberry Pi 4 *if* you run 64-bit Raspberry Pi OS (see README).
+# Deliberately avoided: TA-Lib (C build), vectorbt/numba (flaky on ARM),
+# pyarrow (heavy) — indicators are computed in plain pandas, cache is CSV.
+
+alpaca-py>=0.33,<1.0        # broker + market data (pure Python; pydantic-core has aarch64 wheels)
+python-dotenv>=1.0,<2.0
+pandas>=2.2,<3.0
+numpy>=1.26,<3.0
+requests>=2.31,<3.0
+anthropic>=0.40             # LLM analyst (pure Python)
+
+# Optional fallback data source (uncomment if wanted; pulls in lxml — has ARM wheels but heavier):
+# yfinance>=0.2.40

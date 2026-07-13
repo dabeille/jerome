@@ -1,0 +1,95 @@
+"""Entry point. Run via cron/systemd on the Pi:
+
+    python -m bot.main morning    # ~9:00 ET: scan, propose/execute entries
+    python -m bot.main midday     # ~12:30 ET: optional second scan
+    python -m bot.main close      # ~15:45 ET: manage exits, snapshot equity
+
+Order of operations per run: kill switch -> circuit breakers -> signals ->
+LLM review -> risk gate -> (approval) -> execute -> journal + dashboard.
+"""
+
+import sys
+
+from bot import approve, broker, config, data, journal, risk
+from bot.signals import llm_analyst, meanrev, momentum
+
+
+def run(session: str) -> None:
+    config.validate()
+
+    # 1. Kill switch — checked before anything else touches the broker.
+    if risk.kill_switch_active():
+        print("KILL file present — flattening and exiting.")
+        if config.MODE != "backtest":
+            broker.flatten_all("kill switch")
+        return
+
+    if config.MODE == "backtest":
+        sys.exit("Use backtest/run.py for backtests, not bot.main")
+
+    equity = broker.equity()
+    journal.log_equity(equity, float(broker.account().cash), f"{session} start")
+
+    # 2. Circuit breakers (plan §5).
+    if risk.drawdown_breached(equity):
+        broker.flatten_all("drawdown circuit breaker")
+        journal.log_decision(session, "*", "risk", "HALT-DRAWDOWN",
+                             reasoning="-20% from high-water mark")
+        return
+    if risk.daily_loss_breached(equity):
+        broker.flatten_all("daily loss limit")
+        journal.log_decision(session, "*", "risk", "HALT-DAILY",
+                             reasoning="-6% on the day")
+        return
+
+    if session == "close":
+        _write_dashboard(session)
+        return  # exits are bracket-managed broker-side; close run = snapshot
+
+    # 3. Signals.
+    bars = data.get_daily_bars(config.UNIVERSE, refresh=True)
+    signals = momentum.scan(bars) + meanrev.scan(bars)
+    for s in signals:
+        journal.log_decision(session, s.symbol, s.strategy, "candidate",
+                             s.score, s.entry, s.stop, s.target,
+                             reasoning=s.reasoning)
+
+    # 4. LLM analyst review (veto layer).
+    syms = [s.symbol for s in signals]
+    signals = llm_analyst.review(signals, data.get_headlines(syms),
+                                 data.earnings_within(syms))
+
+    # 5. Risk gate.
+    proposals = risk.gate(signals, equity, broker.open_position_symbols(),
+                          trades_today=0)  # TODO(1.1): count today's fills
+
+    # 6. Approval gate (Phase 2 only), then execute.
+    if config.MODE == "approve":
+        proposals = approve.request_approval(proposals)
+    for sig, qty in proposals:
+        order_id = broker.submit_bracket(sig, qty)
+        journal.log_decision(session, sig.symbol, sig.strategy, "entered",
+                             sig.score, sig.entry, sig.stop, sig.target,
+                             qty, f"order {order_id}")
+
+    _write_dashboard(session)
+
+
+def _write_dashboard(session: str) -> None:
+    acct = broker.account()
+    positions = broker.client().get_all_positions()
+    pos_lines = "\n".join(
+        f"- {p.symbol}: {p.qty} @ {p.avg_entry_price} "
+        f"(P&L {float(p.unrealized_pl):+.2f})"
+        for p in positions
+    ) or "(none)"
+    journal.write_dashboard(
+        f"Equity: ${float(acct.equity):,.2f} · Cash: ${float(acct.cash):,.2f} "
+        f"· last run: {session}",
+        pos_lines,
+        "See data/journal.db (decisions table).",
+    )
+
+
+if __name__ == "__main__":
+    run(sys.argv[1] if len(sys.argv) > 1 else "morning")
