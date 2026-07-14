@@ -1,19 +1,26 @@
-# Secrets — never commit
+# --- Secrets: NEVER commit these ---
 .env
+.env.*
+!.env.example
 *.pem
 *.key
 
-# Runtime state / local data
-data/
-KILL
-dashboard.md
-
-# Python
+# --- Python ---
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 venv/
 *.egg-info/
 
-# OS
+# --- Local data / journal / caches ---
+data/
+*.db
+*.sqlite
+*.sqlite3
+KILL
+dashboard.md
+
+# --- OS / editor cruft ---
 .DS_Store
+.vscode/
+.idea/
