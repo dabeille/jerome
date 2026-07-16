@@ -24,3 +24,6 @@ dashboard.md
 .DS_Store
 .vscode/
 .idea/
+
+# --- Local docs ---
+docs/
