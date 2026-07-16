@@ -1,5 +1,7 @@
 """Risk gate (plan §5). Every trade passes through here; no exceptions."""
 
+from __future__ import annotations  # py3.9 compat
+
 from datetime import datetime, timezone
 
 from bot import config, journal

@@ -16,8 +16,15 @@ dashboard.md    regenerated each run (gitignored)
 
 ## Setup
 
+**Python 3.10+ recommended** (3.9 works — the code carries
+`from __future__ import annotations` for it — but 3.9 is EOL). Heads-up for
+macOS: bare `python3` may be the Xcode Command Line Tools 3.9 build, which
+also triggers a harmless `NotOpenSSLWarning` from urllib3 because it links
+LibreSSL. Prefer a Homebrew Python: `brew install python@3.12`, then build
+the venv with `python3.12`. Raspberry Pi OS Bookworm ships 3.11 — fine as-is.
+
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate   # or python3 if it's ≥3.10
 pip install -r requirements.txt
 cp .env.example .env && chmod 600 .env   # then fill in your keys
 python -m scripts.smoke_test             # verifies auth, data, order round-trip

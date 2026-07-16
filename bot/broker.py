@@ -1,6 +1,8 @@
 """Broker wrapper around alpaca-py. All order flow goes through this module
 so the kill switch and journaling can't be bypassed."""
 
+from __future__ import annotations  # py3.9 compat (X | None, list[str] in annotations)
+
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import (

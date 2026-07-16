@@ -11,6 +11,8 @@ seconds even on a Pi).
 - Report: expectancy, win rate, max drawdown, trades/day, equity curve CSV
 """
 
+from __future__ import annotations  # py3.9 compat
+
 from dataclasses import dataclass
 
 SLIPPAGE = 0.0005

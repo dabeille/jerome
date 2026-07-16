@@ -5,6 +5,8 @@ Intended signals:
 - Exit on close above 5-day SMA, hard stop ~3% below entry
 """
 
+from __future__ import annotations  # py3.9 compat
+
 import pandas as pd
 
 from bot.signals import Signal

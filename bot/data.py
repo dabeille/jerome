@@ -4,6 +4,8 @@ CSV over parquet on purpose: avoids the pyarrow dependency, which is heavy
 on a Raspberry Pi. Daily bars for ~60 symbols is tiny data — CSV is fine.
 """
 
+from __future__ import annotations  # py3.9 compat
+
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd

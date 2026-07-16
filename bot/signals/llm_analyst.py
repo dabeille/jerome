@@ -5,6 +5,8 @@ events (earnings tonight, FDA decisions, macro releases), and may adjust
 conviction scores. Step 0.4.3 — prompt & parsing TODO.
 """
 
+from __future__ import annotations  # py3.9 compat
+
 from bot import config
 from bot.signals import Signal
 

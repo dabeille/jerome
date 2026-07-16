@@ -5,6 +5,8 @@ from the Pi) and each entry needs an explicit y. Anything else = skip.
 Later this can become a morning message via a Cowork scheduled task.
 """
 
+from __future__ import annotations  # py3.9 compat
+
 from bot.signals import Signal
 
 

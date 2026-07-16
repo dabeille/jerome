@@ -7,6 +7,8 @@ Intended signals:
   target 3R+ or trailing exit
 """
 
+from __future__ import annotations  # py3.9 compat
+
 import pandas as pd
 
 from bot.signals import Signal
