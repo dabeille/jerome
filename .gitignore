@@ -27,3 +27,5 @@ dashboard.md
 
 # --- Local docs ---
 docs/
+# --- Claude Code local settings ---
+.claude/settings.local.json
