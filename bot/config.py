@@ -49,7 +49,7 @@ STOCK_UNIVERSE = [
     "JPM", "BAC", "GS", "V", "MA", "XOM", "CVX", "UNH", "LLY", "JNJ", "MRK",
     "COST", "WMT", "HD", "NKE", "MCD", "DIS", "NFLX", "CRM", "ORCL", "ADBE",
     "INTC", "MU", "QCOM", "TXN", "CAT", "DE", "BA", "GE", "UBER", "ABNB",
-    "PLTR", "COIN", "SHOP", "SQ", "PYPL", "SOFI", "F", "GM", "T", "VZ",
+    "PLTR", "COIN", "SHOP", "XYZ", "PYPL", "SOFI", "F", "GM", "T", "VZ",
 ]
 UNIVERSE = ETF_UNIVERSE + STOCK_UNIVERSE
 

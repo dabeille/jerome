@@ -23,6 +23,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import requests
+from alpaca.data.enums import Adjustment
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.requests import NewsRequest, StockBarsRequest
@@ -104,7 +105,8 @@ def _fetch_alpaca(symbols: list[str], start: datetime) -> dict[str, pd.DataFrame
     """
     try:
         req = StockBarsRequest(symbol_or_symbols=symbols,
-                               timeframe=TimeFrame.Day, start=start)
+                               timeframe=TimeFrame.Day, start=start,
+                               adjustment=Adjustment.ALL)  # split + dividend
         bars = client().get_stock_bars(req).df
     except Exception as e:  # noqa: BLE001 — any failure ⇒ try the fallback
         print(f"Alpaca fetch failed ({e}); falling back to yfinance.",
@@ -135,7 +137,7 @@ def _fetch_yfinance(symbols: list[str], start: datetime) -> dict[str, pd.DataFra
     for sym in symbols:
         try:
             df = yf.Ticker(sym).history(start=start_str, interval="1d",
-                                        auto_adjust=False)
+                                        auto_adjust=True)  # split + dividend
         except Exception as e:  # noqa: BLE001 — skip this symbol, keep going
             print(f"  yfinance {sym} failed: {e}", file=sys.stderr)
             continue
