@@ -1,7 +1,6 @@
 # jerome — AI trading bot
 
-An experiment: 1–3 stock/ETF trades/day on a small account, quant signals +
-LLM veto layer, via Alpaca. Full plan: [trading-bot-plan.md](trading-bot-plan.md).
+An experiment: 1–3 stock/ETF trades/day on a small account, quant signals with an LLM veto layer, via Alpaca.
 
 ## Layout
 
