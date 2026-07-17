@@ -56,11 +56,13 @@ UNIVERSE = ETF_UNIVERSE + STOCK_UNIVERSE
 # --- Paths -------------------------------------------------------------------
 DATA_DIR = ROOT / "data"
 BARS_DIR = DATA_DIR / "bars"
+NEWS_DIR = DATA_DIR / "news"          # cached headlines, one JSON per day
+EARNINGS_DIR = DATA_DIR / "earnings"  # cached earnings calendar, one JSON per day
 JOURNAL_DB = DATA_DIR / "journal.db"
 KILL_FILE = ROOT / "KILL"            # touch this file to halt + liquidate
 DASHBOARD = ROOT / "dashboard.md"
 
-for d in (DATA_DIR, BARS_DIR):
+for d in (DATA_DIR, BARS_DIR, NEWS_DIR, EARNINGS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 
