@@ -1,8 +1,10 @@
 """Central configuration. No secrets in this file — secrets live in .env."""
 
+import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -42,17 +44,6 @@ DRAWDOWN_HALT = -0.20        # halt until manual review
 MAX_BUYING_POWER_MULT = 1.0  # never use leverage even if margin grants it
 MAX_TRADES_PER_DAY = 3
 
-# --- Universe ----------------------------------------------------------------
-ETF_UNIVERSE = ["SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV", "XLI", "SMH"]
-STOCK_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "AVGO",
-    "JPM", "BAC", "GS", "V", "MA", "XOM", "CVX", "UNH", "LLY", "JNJ", "MRK",
-    "COST", "WMT", "HD", "NKE", "MCD", "DIS", "NFLX", "CRM", "ORCL", "ADBE",
-    "INTC", "MU", "QCOM", "TXN", "CAT", "DE", "BA", "GE", "UBER", "ABNB",
-    "PLTR", "COIN", "SHOP", "XYZ", "PYPL", "SOFI", "F", "GM", "T", "VZ",
-]
-UNIVERSE = ETF_UNIVERSE + STOCK_UNIVERSE
-
 # --- Paths -------------------------------------------------------------------
 DATA_DIR = ROOT / "data"
 BARS_DIR = DATA_DIR / "bars"
@@ -65,6 +56,46 @@ DASHBOARD = ROOT / "dashboard.md"
 for d in (DATA_DIR, BARS_DIR, NEWS_DIR, EARNINGS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
+# --- Universe (two tiers) -----------------------------------------------------
+# CORE: static, always-liquid — mega-caps that anchor the scan plus high-beta
+# names with the range the momentum thesis (plan §4A) actually needs.
+# DYNAMIC: whatever is currently in play — refreshed weekly by
+# scripts/refresh_universe.py into data/dynamic_universe.json (screen rules in
+# bot/universe.py). Missing or stale file just means we trade the static tiers.
+ETF_UNIVERSE = [
+    "SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV", "XLI", "SMH",
+    "XBI", "KRE", "GDX", "ARKK",  # less-correlated dip feedstock for meanrev
+]
+CORE_STOCKS = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "AVGO",
+    "JPM", "BAC", "GS", "V", "MA", "XOM", "CVX", "UNH", "LLY",
+    "COST", "HD", "NKE", "MCD", "DIS", "NFLX", "CRM", "ORCL", "ADBE",
+    "INTC", "MU", "QCOM", "TXN", "CAT", "DE", "BA", "GE", "UBER", "ABNB",
+    "PLTR", "COIN", "SHOP", "XYZ", "PYPL", "SOFI",
+    "HOOD", "MSTR", "ARM", "CRWD", "MRVL", "SMCI", "APP", "VST",
+]
+
+DYNAMIC_UNIVERSE_FILE = DATA_DIR / "dynamic_universe.json"
+DYNAMIC_UNIVERSE_MAX_AGE_DAYS = 10  # warn past this (see validate())
+
+
+def _load_dynamic_universe() -> "list[str]":
+    """Scanner output minus anything already in a static tier."""
+    if not DYNAMIC_UNIVERSE_FILE.exists():
+        return []
+    try:
+        payload = json.loads(DYNAMIC_UNIVERSE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    static = set(ETF_UNIVERSE) | set(CORE_STOCKS)
+    return [s for s in payload.get("symbols", [])
+            if isinstance(s, str) and s not in static]
+
+
+DYNAMIC_STOCKS = _load_dynamic_universe()
+STOCK_UNIVERSE = CORE_STOCKS + DYNAMIC_STOCKS
+UNIVERSE = ETF_UNIVERSE + STOCK_UNIVERSE
+
 
 def validate() -> None:
     """Fail loudly on misconfiguration. Called by main() before anything else."""
@@ -74,7 +105,26 @@ def validate() -> None:
         sys.exit(f"Missing Alpaca keys for mode '{MODE}' — check .env")
     if IS_LIVE:
         print(f"*** {MODE.upper()} MODE — REAL MONEY ***", file=sys.stderr)
+    _check_dynamic_universe()
     _check_env_perms()
+
+
+def _check_dynamic_universe() -> None:
+    """The dynamic tier is optional, but it shouldn't rot silently."""
+    if not DYNAMIC_UNIVERSE_FILE.exists():
+        print(
+            "NOTE: no dynamic universe file — trading static tiers only. "
+            "Run: python -m scripts.refresh_universe",
+            file=sys.stderr,
+        )
+        return
+    age_days = (time.time() - DYNAMIC_UNIVERSE_FILE.stat().st_mtime) / 86400
+    if age_days > DYNAMIC_UNIVERSE_MAX_AGE_DAYS:
+        print(
+            f"WARNING: dynamic universe is {age_days:.0f} days old — "
+            "run: python -m scripts.refresh_universe",
+            file=sys.stderr,
+        )
 
 
 def _check_env_perms() -> None:
