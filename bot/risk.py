@@ -4,7 +4,7 @@ from __future__ import annotations  # py3.9 compat
 
 from datetime import datetime, timezone
 
-from bot import config, journal
+from bot import config, journal, sectors
 from bot.signals import Signal
 
 
@@ -39,6 +39,11 @@ def gate(signals: list[Signal], equity: float,
     approved: list[tuple[Signal, int]] = []
     slots = min(config.MAX_OPEN_POSITIONS - len(open_positions),
                 config.MAX_TRADES_PER_DAY - trades_today)
+    sector_counts: dict[str, int] = {}
+    for sym in open_positions:
+        sec = sectors.sector_of(sym)
+        if sec:
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
     for sig in sorted(signals, key=lambda s: s.score, reverse=True):
         if len(approved) >= max(slots, 0):
             break
@@ -47,6 +52,10 @@ def gate(signals: list[Signal], equity: float,
         qty = position_size(equity, sig)
         if qty < 1:
             continue
-        # TODO(0.5.1): sector-concentration check (MAX_PER_SECTOR)
+        sec = sectors.sector_of(sig.symbol)
+        if sec and sector_counts.get(sec, 0) >= config.MAX_PER_SECTOR:
+            continue
         approved.append((sig, qty))
+        if sec:
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
     return approved
