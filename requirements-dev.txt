@@ -1,0 +1,5 @@
+# Dev/test-only dependencies — NOT needed on the Pi at runtime. Kept out of the
+# runtime requirements.txt so a deploy stays minimal. Install alongside it:
+#     pip install -r requirements.txt -r requirements-dev.txt
+
+pytest>=8,<9   # data-layer test suite (tests/); pure Python, offline
