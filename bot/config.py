@@ -33,6 +33,8 @@ else:
 FINNHUB_KEY = os.getenv("FINNHUB_KEY", "")
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+LLM_MODEL = "claude-opus-4-8"   # analyst veto/conviction call (plan §4C)
+LLM_MAX_TOKENS = 1024           # small JSON verdict object, one call/run
 
 # --- Risk constants (see plan §5) -------------------------------------------
 RISK_PER_TRADE = 0.03        # fraction of equity risked per trade
