@@ -109,3 +109,32 @@ def test_missing_benchmark_reported_and_skips_calendar_checks():
         i.kind == "missing_days" and "not in dataset" in i.detail for i in issues
     )
     assert "stale" not in _kinds(issues, "AAA")
+
+
+def test_suspected_split_is_advisory_other_kinds_are_gating():
+    closes = [100.0] * 9 + [200.0]  # legit-or-not, this is advisory not gating
+    sym = _bars(BENCH_DATES, closes)
+    sym.iloc[2, sym.columns.get_loc("volume")] = -5  # also trip a gating issue
+    issues = data_checks.run_checks({"SPY": _bars(BENCH_DATES), "AAA": sym})
+
+    split_issues = [i for i in issues if i.kind == "suspected_split"]
+    other_issues = [i for i in issues if i.kind != "suspected_split"]
+    assert split_issues and all(i.severity == "advisory" for i in split_issues)
+    assert other_issues and all(i.severity == "gating" for i in other_issues)
+
+
+def test_should_gate_on_gating_issue():
+    issues = [data_checks.Issue("AAA", "ohlc_integrity", "bad", severity="gating")]
+    assert data_checks.should_gate(issues) is True
+    assert data_checks.should_gate(issues, strict=True) is True
+
+
+def test_should_gate_advisory_only_default_false_strict_true():
+    issues = [data_checks.Issue("AAA", "suspected_split", "big move", severity="advisory")]
+    assert data_checks.should_gate(issues) is False
+    assert data_checks.should_gate(issues, strict=True) is True
+
+
+def test_should_gate_empty_issues_false():
+    assert data_checks.should_gate([]) is False
+    assert data_checks.should_gate([], strict=True) is False

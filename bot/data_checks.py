@@ -29,12 +29,17 @@ STALE_MAX_LAG = 3          # benchmark trading days the last bar may trail by
 SPLIT_MOVE_THRESHOLD = 0.5  # |close-to-close| beyond this ⇒ suspected split
 _MISSING_EXAMPLES = 5      # how many example gap dates to include in a report
 
+# suspected_split flags real 50%+ movers in high-beta names (HOOD, IREN, WULF)
+# as often as it flags genuine unadjusted splits, so it's advisory, not gating.
+ADVISORY_KINDS = frozenset({"suspected_split"})
+
 
 @dataclass
 class Issue:
     symbol: str
     kind: str      # missing_days | stale | suspected_split | ohlc_integrity
     detail: str
+    severity: str = "gating"  # "gating" blocks the check_data gate; "advisory" warns only
 
     def __str__(self) -> str:
         return f"[{self.kind}] {self.symbol}: {self.detail}"
@@ -64,6 +69,16 @@ def run_checks(bars: dict[str, pd.DataFrame],
 
     issues.sort(key=lambda i: (i.symbol, i.kind))
     return issues
+
+
+def should_gate(issues: list[Issue], strict: bool = False) -> bool:
+    """Whether ``issues`` should fail a backtest/CI gate.
+
+    Gating issues (ohlc_integrity, missing_days, stale) always fail. Advisory
+    issues (suspected_split) only fail when ``strict`` is set."""
+    if any(i.severity == "gating" for i in issues):
+        return True
+    return strict and any(i.severity == "advisory" for i in issues)
 
 
 def _check_missing(sym: str, df: pd.DataFrame, ref: list[date]) -> list[Issue]:
@@ -106,7 +121,8 @@ def _check_split(sym: str, df: pd.DataFrame) -> list[Issue]:
     hits = pct[pct.abs() > SPLIT_MOVE_THRESHOLD].dropna()
     return [
         Issue(sym, "suspected_split",
-              f"{ts.date()} close moved {chg:+.0%} (adjusted-data anomaly?)")
+              f"{ts.date()} close moved {chg:+.0%} (adjusted-data anomaly?)",
+              severity="advisory")
         for ts, chg in hits.items()
     ]
 
