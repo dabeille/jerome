@@ -22,7 +22,8 @@ plan.md: "$500-1,000" / the "$750" worked risk-per-trade example).
 
 from __future__ import annotations  # py3.9 compat
 
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -69,7 +70,27 @@ class _Pending:
     qty: int
 
 
-def run_backtest(start: str, end: str, strict: bool = False) -> tuple[list[Trade], pd.Series]:
+@dataclass
+class HaltEvent:
+    date: str
+    kind: str  # "drawdown" | "daily_loss"
+    equity: float
+    hwm: float
+    resumed: bool  # False for a terminal drawdown halt (resume_after_days=None)
+
+
+@dataclass
+class BacktestResult:
+    trades: list[Trade]
+    equity_curve: pd.Series
+    funnel: dict[str, int]
+    halts: list[HaltEvent]
+    params: dict = field(default_factory=dict)
+
+
+def run_backtest(start: str, end: str, strict: bool = False,
+                 resume_after_days: int | None = None,
+                 starting_equity: float = STARTING_EQUITY) -> BacktestResult:
     """Replay the live per-run ordering (signals -> risk gate -> fills) day by
     day over cached bars in ``[start, end]``. No network, no LLM veto layer.
 
@@ -77,7 +98,14 @@ def run_backtest(start: str, end: str, strict: bool = False) -> tuple[list[Trade
     advisory issues like suspected_split normally only warn, but fail the run
     when set.
 
-    Returns (closed trades, equity curve indexed by date).
+    A daily-loss halt flattens and skips only that trading day (plan §5:
+    "stops until the next day"). A drawdown halt is terminal by default,
+    faithful to live — the run ends the day it's flattened. Set
+    ``resume_after_days=N`` to model the plan §5 human review: stay flat for
+    N trading days, then rebase the high-water mark to that day's equity and
+    keep going, mirroring what ``journal.mark_resume()`` does live.
+
+    Returns a BacktestResult (trades, equity_curve, funnel, halts, params).
     """
     bars = data.get_daily_bars(config.UNIVERSE, refresh=False)
 
@@ -99,19 +127,20 @@ def run_backtest(start: str, end: str, strict: bool = False) -> tuple[list[Trade
     trades: list[Trade] = []
     positions: dict[str, Position] = {}
     pending: list[_Pending] = []
-    cash = STARTING_EQUITY
-    hwm = STARTING_EQUITY
+    cash = starting_equity
+    hwm = starting_equity
     equity_dates: list[pd.Timestamp] = []
     equity_values: list[float] = []
-    trades_today = 0
+    funnel: dict[str, int] = defaultdict(int)
+    halts: list[HaltEvent] = []
+    flat_days_remaining = 0  # counts down a resume_after_days wait
 
     for t in calendar:
         # "Start of day" equity = yesterday's closing mark (matches main.py,
         # which snapshots equity once at session start from the broker —
         # i.e. last night's close, before today's fills move the needle).
-        day_start_equity = equity_values[-1] if equity_values else STARTING_EQUITY
+        day_start_equity = equity_values[-1] if equity_values else starting_equity
         trades_today = 0
-        halted = False
 
         # 1. Manage open positions / bracket exits against today's bar.
         for sym in list(positions):
@@ -142,12 +171,25 @@ def run_backtest(start: str, end: str, strict: bool = False) -> tuple[list[Trade
         )
         hwm = max(hwm, equity)
 
-        # 3. Circuit breakers (inline, against the in-memory equity curve).
-        if hwm > 0 and (equity - hwm) / hwm <= config.DRAWDOWN_HALT:
-            halted = True
-        elif day_start_equity > 0 and (equity - day_start_equity) / day_start_equity <= config.DAILY_LOSS_LIMIT:
-            halted = True
-        if halted:
+        # 3. Still waiting out an earlier drawdown halt's resume_after_days
+        # countdown — stay flat, no breach checks, no fills, no signals.
+        if flat_days_remaining > 0:
+            flat_days_remaining -= 1
+            if flat_days_remaining == 0:
+                hwm = equity  # rebase, mirrors journal.mark_resume() live
+            equity_dates.append(t)
+            equity_values.append(equity)
+            continue
+
+        # 4. Circuit breakers (inline, against the in-memory equity curve).
+        # Drawdown takes priority over daily-loss, same as live risk.py.
+        drawdown_breach = hwm > 0 and (equity - hwm) / hwm <= config.DRAWDOWN_HALT
+        daily_loss_breach = (
+            not drawdown_breach and day_start_equity > 0
+            and (equity - day_start_equity) / day_start_equity <= config.DAILY_LOSS_LIMIT
+        )
+        if drawdown_breach or daily_loss_breach:
+            funnel["fill_dropped_halt"] += len(pending)
             for sym in list(positions):
                 df = bars[sym]
                 if t not in df.index:
@@ -169,36 +211,59 @@ def run_backtest(start: str, end: str, strict: bool = False) -> tuple[list[Trade
                 p.qty * _close_on(bars[p.symbol], t, default=p.entry) for p in positions.values()
             )
             pending = []
+            equity_dates.append(t)
+            equity_values.append(equity)
 
-        # 4. Fill pending entries queued from the prior day at today's open.
+            if drawdown_breach:
+                resumed = resume_after_days is not None
+                halts.append(HaltEvent(date=str(t.date()), kind="drawdown",
+                                       equity=equity, hwm=hwm, resumed=resumed))
+                if not resumed:
+                    break  # terminal, faithful to live — no resume mechanism
+                if resume_after_days == 0:
+                    hwm = equity  # nothing to wait out, rebase immediately
+                else:
+                    flat_days_remaining = resume_after_days
+            else:
+                halts.append(HaltEvent(date=str(t.date()), kind="daily_loss",
+                                       equity=equity, hwm=hwm, resumed=True))
+            continue
+
+        # 5. Fill pending entries queued from the prior day at today's open.
         # Anything that can't fill today (already held, no bar, insufficient
         # cash) is dropped rather than retried — fresh signals get generated
-        # every day regardless (step 5-6).
-        if not halted:
-            for p in pending:
-                sym = p.signal.symbol
-                df = bars[sym]
-                if sym in positions or t not in df.index:
-                    continue
-                fill = df.loc[t, "open"] * (1 + SLIPPAGE)
-                cost = fill * p.qty
-                if cost > cash:
-                    continue
-                cash -= cost
-                positions[sym] = Position(
-                    symbol=sym, entry_date=str(t.date()), entry=fill,
-                    qty=p.qty, stop=p.signal.stop, target=p.signal.target,
-                    strategy=p.signal.strategy,
-                )
-                trades_today += 1
+        # every day regardless (step 6-7).
+        for p in pending:
+            sym = p.signal.symbol
+            df = bars[sym]
+            if sym in positions:
+                funnel["fill_already_held"] += 1
+                continue
+            if t not in df.index:
+                funnel["fill_no_bar"] += 1
+                continue
+            fill = df.loc[t, "open"] * (1 + SLIPPAGE)
+            cost = fill * p.qty
+            if cost > cash:
+                funnel["fill_insufficient_cash"] += 1
+                continue
+            cash -= cost
+            positions[sym] = Position(
+                symbol=sym, entry_date=str(t.date()), entry=fill,
+                qty=p.qty, stop=p.signal.stop, target=p.signal.target,
+                strategy=p.signal.strategy,
+            )
+            trades_today += 1
+            funnel["filled"] += 1
 
-        # 5-6. Generate signals off history up to and including today, then
+        # 6-7. Generate signals off history up to and including today, then
         # gate them and queue approved entries for tomorrow's open.
-        if not halted:
-            sliced = {sym: df.loc[:t] for sym, df in bars.items()}
-            signals: list[Signal] = momentum.scan(sliced) + meanrev.scan(sliced)
-            approved = risk.gate(signals, equity, list(positions), trades_today)
-            pending = [_Pending(sig, qty) for sig, qty in approved]
+        sliced = {sym: df.loc[:t] for sym, df in bars.items()}
+        signals: list[Signal] = momentum.scan(sliced) + meanrev.scan(sliced)
+        funnel["signals_generated"] += len(signals)
+        approved = risk.gate(signals, equity, list(positions), trades_today,
+                             reject_counts=funnel)
+        pending = [_Pending(sig, qty) for sig, qty in approved]
 
         equity_dates.append(t)
         equity_values.append(equity)
@@ -218,7 +283,19 @@ def run_backtest(start: str, end: str, strict: bool = False) -> tuple[list[Trade
             ))
 
     equity_curve = pd.Series(equity_values, index=pd.DatetimeIndex(equity_dates, name="timestamp"))
-    return trades, equity_curve
+    params = dict(
+        start=start, end=end, strict=strict,
+        starting_equity=starting_equity, resume_after_days=resume_after_days,
+        risk_per_trade=config.RISK_PER_TRADE, max_position_pct=config.MAX_POSITION_PCT,
+        max_open_positions=config.MAX_OPEN_POSITIONS, max_per_sector=config.MAX_PER_SECTOR,
+        daily_loss_limit=config.DAILY_LOSS_LIMIT, drawdown_halt=config.DRAWDOWN_HALT,
+        max_trades_per_day=config.MAX_TRADES_PER_DAY,
+        relvol_mult=momentum.RELVOL_MULT, rs_top_pct=momentum.RS_TOP_PCT,
+        target_r=momentum.TARGET_R, rsi_oversold=meanrev.RSI_OVERSOLD,
+        stop_pct=meanrev.STOP_PCT,
+    )
+    return BacktestResult(trades=trades, equity_curve=equity_curve,
+                          funnel=dict(funnel), halts=halts, params=params)
 
 
 def _close_on(df: pd.DataFrame, t: pd.Timestamp, default: float) -> float:

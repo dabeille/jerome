@@ -1,22 +1,25 @@
-"""CLI for the backtest engine (step 0.5.2).
+"""CLI for the backtest engine (steps 0.5.2/0.5.4).
 
     python -m backtest.run --start 2019-01-01 --end 2026-06-30
 
 Runs entirely offline against cached bars in data/bars/ (BOT_MODE=backtest
-means no broker connection and no Alpaca keys are required). Prints a thin
-sanity summary and writes the equity curve to data/backtest_equity.csv. The
-full expectancy/max-DD/trades-per-day report is step 0.5.4.
+means no broker connection and no Alpaca keys are required). Writes the
+equity curve to data/backtest_equity.csv and the full report (expectancy,
+win rate, max drawdown, trades/day, per-strategy/exit breakdowns, halt log,
+signal funnel) to data/backtest_report.md, and prints a compact summary.
 """
 
-from __future__ import annotations  # py3.9 compat
+from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 
 os.environ.setdefault("BOT_MODE", "backtest")  # must precede any bot.* import
 
-from backtest.engine import run_backtest  # noqa: E402 -- after BOT_MODE is set
-from bot import config  # noqa: E402
+from backtest import report  # noqa: E402
+from backtest.engine import STARTING_EQUITY, run_backtest  # noqa: E402
+from bot import config, data  # noqa: E402
 
 
 def main() -> None:
@@ -26,17 +29,34 @@ def main() -> None:
     parser.add_argument("--strict", action="store_true",
                         help="also gate the run on advisory data issues "
                              "(e.g. suspected splits), not just gating ones")
+    parser.add_argument("--resume-after", type=int, default=None, metavar="N",
+                        help="model the plan §5 human review: stay flat N "
+                             "trading days after a drawdown halt, then rebase "
+                             "the high-water mark and continue (default: the "
+                             "halt ends the run, faithful to live)")
+    parser.add_argument("--equity", type=float, default=STARTING_EQUITY, metavar="N",
+                        help="starting equity (default: $%(default)s)")
+    parser.add_argument("--report", default=None, metavar="PATH",
+                        help="report path (default: data/backtest_report.md)")
     args = parser.parse_args()
 
     try:
-        trades, equity_curve = run_backtest(args.start, args.end, strict=args.strict)
+        result = run_backtest(args.start, args.end, strict=args.strict,
+                              resume_after_days=args.resume_after,
+                              starting_equity=args.equity)
     except RuntimeError as e:
         raise SystemExit(str(e))
 
     out_path = config.DATA_DIR / "backtest_equity.csv"
-    equity_curve.to_csv(out_path, header=["equity"])
+    result.equity_curve.to_csv(out_path, header=["equity"])
     print(f"Equity curve written to {out_path}")
 
+    report_path = Path(args.report) if args.report else config.DATA_DIR / "backtest_report.md"
+    bars = data.get_daily_bars(config.UNIVERSE, refresh=False)
+    report.write_report(result, bars["SPY"], report_path)
+    print(f"Report written to {report_path}")
+
+    trades, equity_curve = result.trades, result.equity_curve
     if not trades or len(equity_curve) < 2:
         print(f"{args.start} -> {args.end}: {len(trades)} trade(s) — "
               f"not enough data for a summary.")
@@ -49,6 +69,12 @@ def main() -> None:
     print(f"{args.start} -> {args.end} ({days} trading days): "
          f"{len(trades)} trades, win rate {win_rate:.0%}, "
          f"total return {total_return:+.1%}")
+
+    if result.halts:
+        last = result.halts[-1]
+        outcome = "resumed" if last.resumed else "TERMINAL — run stopped early"
+        print(f"Halt: {last.kind} on {last.date} (equity ${last.equity:,.2f}, "
+             f"HWM ${last.hwm:,.2f}) — {outcome}")
 
 
 if __name__ == "__main__":

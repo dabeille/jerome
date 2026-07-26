@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 
 from bot import config
 
+RESUME_NOTE = "resume-after-halt"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
     ts TEXT, run TEXT, symbol TEXT, strategy TEXT, action TEXT,
@@ -64,9 +66,34 @@ def log_equity(equity: float, cash: float, note: str = "") -> None:
 
 
 def high_water_mark() -> float:
+    """Peak equity since the most recent resume marker, or over all history
+    if the bot has never been halted and resumed (plan §5)."""
     with _conn() as c:
-        row = c.execute("SELECT MAX(equity) FROM equity").fetchone()
+        row = c.execute(
+            "SELECT MAX(equity) FROM equity WHERE ts >= "
+            "(SELECT COALESCE(MAX(ts), '') FROM equity WHERE note = ?)",
+            (RESUME_NOTE,),
+        ).fetchone()
     return row[0] or 0.0
+
+
+def mark_resume(equity: float, cash: float) -> None:
+    """Record operator-approved resumption after a drawdown halt (plan §5:
+    'we review the journal together before resuming'). Rebases
+    high_water_mark() to ignore pre-halt peaks."""
+    log_equity(equity, cash, RESUME_NOTE)
+
+
+def recent_decisions(action: str, limit: int = 5) -> list[tuple[str, str, str]]:
+    """Most recent (ts, symbol, reasoning) rows logged with the given action,
+    newest first."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT ts, symbol, reasoning FROM decisions WHERE action = ? "
+            "ORDER BY ts DESC LIMIT ?",
+            (action, limit),
+        ).fetchall()
+    return rows
 
 
 def equity_at_day_start(date_utc: str) -> float:

@@ -3,6 +3,7 @@
     python -m bot.main morning    # ~9:00 ET: scan, propose/execute entries
     python -m bot.main midday     # ~12:30 ET: optional second scan
     python -m bot.main close      # ~15:45 ET: manage exits, snapshot equity
+    python -m bot.main resume     # after a drawdown halt: operator-gated resume
 
 Order of operations per run: kill switch -> circuit breakers -> signals ->
 LLM review -> risk gate -> (approval) -> execute -> journal + dashboard.
@@ -16,6 +17,10 @@ from bot.signals import llm_analyst, meanrev, momentum
 
 def run(session: str) -> None:
     config.validate()
+
+    if session == "resume":
+        _resume()
+        return
 
     # 1. Kill switch — checked before anything else touches the broker.
     if risk.kill_switch_active():
@@ -35,6 +40,8 @@ def run(session: str) -> None:
         broker.flatten_all("drawdown circuit breaker")
         journal.log_decision(session, "*", "risk", "HALT-DRAWDOWN",
                              reasoning="-20% from high-water mark")
+        print("Halted on drawdown circuit breaker. After reviewing the "
+             "journal together, run: python -m bot.main resume")
         return
     if risk.daily_loss_breached(equity):
         broker.flatten_all("daily loss limit")
@@ -73,6 +80,37 @@ def run(session: str) -> None:
                              qty, f"order {order_id}")
 
     _write_dashboard(session)
+
+
+def _resume() -> None:
+    """Operator-gated recovery from a drawdown halt (plan §5: "we review the
+    journal together before resuming"). Requires typing RESUME on stdin, so a
+    cron-triggered session can never trip this — the halt stays a human gate,
+    it just now has a door."""
+    if config.MODE == "backtest":
+        sys.exit("resume is a live/paper session — a backtest models this "
+                 "with run_backtest(..., resume_after_days=N) instead")
+
+    equity = broker.equity()
+    acct = broker.account()
+    hwm = journal.high_water_mark()
+    drawdown = (equity - hwm) / hwm if hwm > 0 else 0.0
+
+    print(f"Equity: ${equity:,.2f}  HWM: ${hwm:,.2f}  Drawdown: {drawdown:+.1%}")
+    print("Recent HALT-DRAWDOWN decisions:")
+    for ts, symbol, reasoning in journal.recent_decisions("HALT-DRAWDOWN"):
+        print(f"  {ts}  {symbol}  {reasoning}")
+
+    typed = input("Type RESUME to clear the halt and rebase the "
+                 "high-water mark: ")
+    if typed.strip() != "RESUME":
+        print("Not resumed.")
+        return
+
+    journal.mark_resume(equity, float(acct.cash))
+    journal.log_decision("resume", "*", "risk", "HALT-RESUMED",
+                         reasoning=f"operator resumed at equity {equity:,.2f}")
+    print("Resumed — high-water mark rebased to current equity.")
 
 
 def _write_dashboard(session: str) -> None:

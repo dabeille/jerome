@@ -34,8 +34,14 @@ def drawdown_breached(equity_now: float) -> bool:
 
 
 def gate(signals: list[Signal], equity: float,
-         open_positions: list[str], trades_today: int) -> list[tuple[Signal, int]]:
-    """Return (signal, qty) pairs that pass all checks, best score first."""
+         open_positions: list[str], trades_today: int,
+         reject_counts: dict[str, int] | None = None) -> list[tuple[Signal, int]]:
+    """Return (signal, qty) pairs that pass all checks, best score first.
+
+    ``reject_counts``, if given, is incremented in place with the reason each
+    dropped signal was dropped: vetoed, already_held, size_zero, sector_cap,
+    slots_full. Default None leaves gate()'s behaviour unchanged.
+    """
     approved: list[tuple[Signal, int]] = []
     slots = min(config.MAX_OPEN_POSITIONS - len(open_positions),
                 config.MAX_TRADES_PER_DAY - trades_today)
@@ -44,16 +50,34 @@ def gate(signals: list[Signal], equity: float,
         sec = sectors.sector_of(sym)
         if sec:
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
-    for sig in sorted(signals, key=lambda s: s.score, reverse=True):
+    ranked = sorted(signals, key=lambda s: s.score, reverse=True)
+    for i, sig in enumerate(ranked):
         if len(approved) >= max(slots, 0):
+            # Every remaining candidate is rejected for this same reason —
+            # tally all of them, not just this one, so a funnel report can
+            # reconcile signals in against drops + fills.
+            if reject_counts is not None:
+                reject_counts["slots_full"] = (
+                    reject_counts.get("slots_full", 0) + (len(ranked) - i)
+                )
             break
-        if sig.vetoed or sig.symbol in open_positions:
+        if sig.vetoed:
+            if reject_counts is not None:
+                reject_counts["vetoed"] = reject_counts.get("vetoed", 0) + 1
+            continue
+        if sig.symbol in open_positions:
+            if reject_counts is not None:
+                reject_counts["already_held"] = reject_counts.get("already_held", 0) + 1
             continue
         qty = position_size(equity, sig)
         if qty < 1:
+            if reject_counts is not None:
+                reject_counts["size_zero"] = reject_counts.get("size_zero", 0) + 1
             continue
         sec = sectors.sector_of(sig.symbol)
         if sec and sector_counts.get(sec, 0) >= config.MAX_PER_SECTOR:
+            if reject_counts is not None:
+                reject_counts["sector_cap"] = reject_counts.get("sector_cap", 0) + 1
             continue
         approved.append((sig, qty))
         if sec:
