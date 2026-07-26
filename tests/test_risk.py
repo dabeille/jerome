@@ -160,6 +160,59 @@ def test_gate_unknown_sector_uncapped(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# gate: reject_counts (0.5.4 signal-attrition funnel)
+# ---------------------------------------------------------------------------
+
+
+def test_gate_reject_counts_size_zero(monkeypatch):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS", 5)
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY", 5)
+    signals = [_signal(symbol="AAA", entry=100.0, stop=100.0)]  # untradeable -> qty 0
+    reject_counts: dict[str, int] = {}
+    approved = risk.gate(signals, equity=10_000.0, open_positions=[],
+                         trades_today=0, reject_counts=reject_counts)
+    assert approved == []
+    assert reject_counts == {"size_zero": 1}
+
+
+def test_gate_reject_counts_sector_cap(monkeypatch):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS", 10)
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY", 10)
+    signals = [
+        _signal(symbol="NVDA", score=90.0),
+        _signal(symbol="AMD", score=80.0),
+        _signal(symbol="MU", score=70.0),  # third semis candidate, dropped
+    ]
+    reject_counts: dict[str, int] = {}
+    approved = risk.gate(signals, equity=10_000.0, open_positions=[],
+                         trades_today=0, reject_counts=reject_counts)
+    assert [s.symbol for s, _ in approved] == ["NVDA", "AMD"]
+    assert reject_counts == {"sector_cap": 1}
+
+
+def test_gate_reject_counts_slots_full(monkeypatch):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS", 1)
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY", 5)
+    signals = [
+        _signal(symbol="JPM", score=90.0),
+        _signal(symbol="GS", score=80.0),
+    ]
+    reject_counts: dict[str, int] = {}
+    approved = risk.gate(signals, equity=10_000.0, open_positions=[],
+                         trades_today=0, reject_counts=reject_counts)
+    assert [s.symbol for s, _ in approved] == ["JPM"]
+    assert reject_counts == {"slots_full": 1}
+
+
+def test_gate_reject_counts_default_none_is_unchanged(monkeypatch):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS", 2)
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY", 5)
+    signals = [_signal(symbol="JPM", score=90.0)]
+    approved = risk.gate(signals, equity=10_000.0, open_positions=[], trades_today=0)
+    assert [s.symbol for s, _ in approved] == ["JPM"]
+
+
+# ---------------------------------------------------------------------------
 # sectors.sector_of
 # ---------------------------------------------------------------------------
 
