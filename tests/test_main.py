@@ -111,8 +111,32 @@ def test_happy_path_threads_entries_today_and_journals_funnel(monkeypatch, tmp_p
     assert funnel is not None
     _, run_name, payload = funnel
     assert run_name == "morning"
+    assert payload["strategies"] == ["momentum", "meanrev"]
     assert payload["signals_generated"] == 0
     assert payload["entered"] == 0
+
+
+def test_enabled_strategies_benches_meanrev(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    _fake_broker(monkeypatch, entries=0)
+    monkeypatch.setattr(main, "data", SimpleNamespace(
+        get_daily_bars=lambda *a, **k: {},
+        get_headlines=lambda syms: {},
+        earnings_within=lambda syms: set()))
+    scanned = []
+    monkeypatch.setattr(main.momentum, "scan",
+                        lambda bars: scanned.append("momentum") or [])
+    monkeypatch.setattr(main.meanrev, "scan", lambda bars: (_ for _ in ()).throw(
+        AssertionError("meanrev is benched and must not be scanned")))
+    monkeypatch.setattr(main.llm_analyst, "review", lambda s, h, e: s)
+    monkeypatch.setattr(main, "_write_dashboard", lambda session: None)
+    monkeypatch.setattr(config, "ENABLED_STRATEGIES", ("momentum",))
+
+    main.run("morning")
+
+    assert scanned == ["momentum"]
+    _, _, payload = journal.last_funnel()
+    assert payload["strategies"] == ["momentum"]
 
 
 def test_naked_position_alerts_and_journals(monkeypatch, tmp_path):

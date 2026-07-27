@@ -38,6 +38,11 @@ python -m bot.main midday    # ~12:30 ET (optional)
 python -m bot.main close     # ~15:45 ET
 ```
 
+The signal modules the loop runs are set by `ENABLED_STRATEGIES` in `.env`
+(default: `momentum,meanrev`). Benching a strategy — e.g. meanrev during a
+retune — is a config change, not a code change; each run journals the active
+set in its funnel row.
+
 ## Raspberry Pi 4 notes
 
 **Use 64-bit Raspberry Pi OS (Lite is ideal).** This is the one hard

@@ -73,7 +73,8 @@ def log_equity(equity: float, cash: float, note: str = "") -> None:
 def log_funnel(run: str, payload: dict) -> None:
     """One signal-attrition row per live run (plan 1.1.5), so the live funnel
     is directly comparable to the backtest's. ``payload`` is the run's
-    signals-in / drops-by-reason / approved counts, stored as JSON."""
+    signals-in / drops-by-reason / approved counts plus the active strategy
+    set, stored as JSON."""
     with _conn() as c:
         c.execute("INSERT INTO funnel VALUES (?,?,?)",
                   (_now(), run, json.dumps(payload, sort_keys=True)))
