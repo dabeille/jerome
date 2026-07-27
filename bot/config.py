@@ -55,6 +55,18 @@ DRAWDOWN_HALT = -0.20        # halt until manual review
 MAX_BUYING_POWER_MULT = 1.0  # never use leverage even if margin grants it
 MAX_TRADES_PER_DAY = 3
 
+# --- Strategy set (checkpoint decision 2026-07-27: blended) ------------------
+# Which signal modules the daily loop scans. Benching one (e.g. meanrev during
+# a retune) or swapping a redesign back in is a .env change, not a code change:
+#     ENABLED_STRATEGIES=momentum
+# The backtest engine's `strategies` parameter mirrors this knob.
+KNOWN_STRATEGIES = ("momentum", "meanrev")
+ENABLED_STRATEGIES = tuple(
+    s.strip() for s in
+    os.getenv("ENABLED_STRATEGIES", ",".join(KNOWN_STRATEGIES)).split(",")
+    if s.strip()
+)
+
 # --- Paths -------------------------------------------------------------------
 DATA_DIR = ROOT / "data"
 BARS_DIR = DATA_DIR / "bars"
@@ -127,6 +139,10 @@ def validate() -> None:
         sys.exit(f"BOT_MODE '{MODE}' invalid; must be one of {VALID_MODES}")
     if MODE != "backtest" and not (ALPACA_KEY_ID and ALPACA_SECRET):
         sys.exit(f"Missing Alpaca keys for mode '{MODE}' — check .env")
+    unknown = set(ENABLED_STRATEGIES) - set(KNOWN_STRATEGIES)
+    if not ENABLED_STRATEGIES or unknown:
+        sys.exit(f"ENABLED_STRATEGIES {ENABLED_STRATEGIES!r} invalid — must "
+                 f"be a non-empty subset of {KNOWN_STRATEGIES}")
     if IS_LIVE:
         print(f"*** {MODE.upper()} MODE — REAL MONEY ***", file=sys.stderr)
     _check_dynamic_universe()

@@ -68,9 +68,14 @@ def run(session: str) -> None:
         _write_dashboard(session)
         return  # exits are bracket-managed broker-side; close run = snapshot
 
-    # 5. Signals.
+    # 5. Signals — modules selected by config.ENABLED_STRATEGIES, so a
+    # strategy can be benched (or a redesign swapped in) via .env alone.
+    # Scanners are resolved here, not at import, so the set is per-run.
+    scanners = {"momentum": momentum.scan, "meanrev": meanrev.scan}
     bars = data.get_daily_bars(config.UNIVERSE, refresh=True)
-    signals = momentum.scan(bars) + meanrev.scan(bars)
+    signals = []
+    for name in config.ENABLED_STRATEGIES:
+        signals += scanners[name](bars)
     for s in signals:
         journal.log_decision(session, s.symbol, s.strategy, "candidate",
                              s.score, s.entry, s.stop, s.target,
@@ -102,6 +107,7 @@ def run(session: str) -> None:
     # 9. Live signal funnel (plan 1.1.5) — one row per run, comparable to the
     # backtest funnel: signals in == entered + approval-skipped + all drops.
     journal.log_funnel(session, {
+        "strategies": list(config.ENABLED_STRATEGIES),
         "signals_generated": len(signals),
         "approved": len(proposals),
         "entered": entered,
