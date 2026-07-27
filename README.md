@@ -2,6 +2,8 @@
 
 An experiment: 1–3 stock/ETF trades/day on a small account, quant signals with an LLM veto layer, via Alpaca.
 
+![Jerome Powell at a podium as a money printer goes brrr](https://media.tenor.com/aWcyWL5BsY0AAAAM/money-printer-go-brr-jerome-powell.gif)
+
 ## Layout
 
 ```
