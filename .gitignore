@@ -19,6 +19,7 @@ data/
 *.sqlite3
 KILL
 dashboard.md
+run/          # cron flock files (kept out of world-writable /tmp)
 
 # --- OS / editor cruft ---
 .DS_Store

@@ -37,6 +37,19 @@ _news_client_: NewsClient | None = None
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 _HTTP_TIMEOUT = 15
 
+
+def _finnhub_auth() -> dict[str, str]:
+    """Finnhub credentials as a header, never a query param.
+
+    Finnhub accepts the token either way, but `requests` embeds the full URL —
+    query string included — in the message of every exception it raises. Those
+    messages get printed to stderr, which cron appends to data/cron.log, so a
+    `?token=` form writes the key to a plaintext file on every transient 4xx/5xx.
+    A header keeps it out of the exception text.
+    """
+    return {"X-Finnhub-Token": config.FINNHUB_KEY}
+
+
 # News tunables.
 _NEWS_LOOKBACK_DAYS = 2   # how far back to pull headlines
 _MAX_HEADLINES = 10       # per symbol, most-recent first
@@ -230,8 +243,8 @@ def _fetch_finnhub_news(symbol: str) -> list[str]:
             f"{FINNHUB_BASE}/company-news",
             params={"symbol": symbol,
                     "from": (today - timedelta(days=_NEWS_LOOKBACK_DAYS)).isoformat(),
-                    "to": today.isoformat(),
-                    "token": config.FINNHUB_KEY},
+                    "to": today.isoformat()},
+            headers=_finnhub_auth(),
             timeout=_HTTP_TIMEOUT,
         )
         r.raise_for_status()
@@ -283,8 +296,8 @@ def _earnings_calendar() -> dict[str, str]:
         r = requests.get(
             f"{FINNHUB_BASE}/calendar/earnings",
             params={"from": today.isoformat(),
-                    "to": (today + timedelta(days=_EARNINGS_HORIZON_DAYS)).isoformat(),
-                    "token": config.FINNHUB_KEY},
+                    "to": (today + timedelta(days=_EARNINGS_HORIZON_DAYS)).isoformat()},
+            headers=_finnhub_auth(),
             timeout=_HTTP_TIMEOUT,
         )
         r.raise_for_status()
