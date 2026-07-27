@@ -4,6 +4,8 @@ gate ranking + slots, and the sector-concentration cap. No network/keys.
 
 from __future__ import annotations
 
+import pytest
+
 from bot import config, journal, risk, sectors
 from bot.signals import Signal
 
@@ -46,6 +48,30 @@ def test_position_size_untradeable():
     equity = 10_000.0
     assert risk.position_size(equity, _signal(entry=100.0, stop=100.0)) == 0
     assert risk.position_size(equity, _signal(entry=0.0, stop=95.0)) == 0
+
+
+def test_position_size_fractional_returns_exact_risk_bound():
+    # entry=50 stop=43 -> risk_per_share=7; risk bound = 0.03*1000/7 ≈ 4.286
+    # shares at $1k (below the by_size bound of 8.0), which the integer path
+    # truncates to 4 but fractional keeps whole.
+    sig = _signal(entry=50.0, stop=43.0)
+    equity = 1_000.0
+    by_risk = (equity * config.RISK_PER_TRADE) / sig.risk_per_share
+    by_size = (equity * config.MAX_POSITION_PCT) / sig.entry
+    assert by_risk < by_size  # risk-bound case
+    frac = risk.position_size(equity, sig, fractional=True)
+    assert frac == pytest.approx(by_risk)
+    assert frac != int(frac)  # genuinely fractional (≈4.286)
+    assert risk.position_size(equity, sig) == 4  # integer path floors
+
+
+def test_position_size_fractional_partial_share():
+    # entry=500 at $1k equity: MAX_POSITION_PCT (40%) caps at 0.8 shares — the
+    # integer path floors to 0 (a size_zero drop), fractional keeps 0.8.
+    sig = _signal(entry=500.0, stop=490.0)
+    equity = 1_000.0
+    assert risk.position_size(equity, sig) == 0
+    assert risk.position_size(equity, sig, fractional=True) == pytest.approx(0.8)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +235,53 @@ def test_gate_reject_counts_default_none_is_unchanged(monkeypatch):
     monkeypatch.setattr(config, "MAX_TRADES_PER_DAY", 5)
     signals = [_signal(symbol="JPM", score=90.0)]
     approved = risk.gate(signals, equity=10_000.0, open_positions=[], trades_today=0)
+    assert [s.symbol for s, _ in approved] == ["JPM"]
+
+
+# ---------------------------------------------------------------------------
+# gate: 0.5.3 tuning knobs (fractional sizing, slot overrides)
+# ---------------------------------------------------------------------------
+
+
+def test_gate_fractional_keeps_sub_share_above_min_notional(monkeypatch):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS", 5)
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY", 5)
+    # entry=500 at $1k equity -> 0.8 shares ($400 notional): integer gate drops
+    # it as size_zero, fractional gate keeps it.
+    signals = [_signal(symbol="AAA", entry=500.0, stop=490.0, score=50.0)]
+    integer = risk.gate(signals, equity=1_000.0, open_positions=[], trades_today=0)
+    assert integer == []
+    frac = risk.gate(signals, equity=1_000.0, open_positions=[], trades_today=0,
+                     fractional=True)
+    assert len(frac) == 1
+    assert frac[0][1] == pytest.approx(0.8)
+
+
+def test_gate_fractional_rejects_below_min_notional(monkeypatch):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS", 5)
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY", 5)
+    # entry=100 stop=1 (rps=99), equity=$10: risk bound = 0.03*10/99 ≈ 0.00303
+    # shares ≈ $0.30 notional, below Alpaca's $1 floor -> size_zero even
+    # in fractional mode.
+    signals = [_signal(symbol="AAA", entry=100.0, stop=1.0, score=50.0)]
+    reject_counts: dict[str, int] = {}
+    frac = risk.gate(signals, equity=10.0, open_positions=[], trades_today=0,
+                     fractional=True, reject_counts=reject_counts)
+    assert frac == []
+    assert reject_counts == {"size_zero": 1}
+
+
+def test_gate_max_open_positions_override(monkeypatch):
+    monkeypatch.setattr(config, "MAX_OPEN_POSITIONS", 3)
+    monkeypatch.setattr(config, "MAX_TRADES_PER_DAY", 3)
+    signals = [
+        _signal(symbol="JPM", score=90.0),
+        _signal(symbol="GS", score=80.0),
+        _signal(symbol="V", score=70.0),
+    ]
+    # Override caps at 1 slot despite config allowing 3.
+    approved = risk.gate(signals, equity=10_000.0, open_positions=[], trades_today=0,
+                         max_open_positions=1, max_trades_per_day=1)
     assert [s.symbol for s, _ in approved] == ["JPM"]
 
 

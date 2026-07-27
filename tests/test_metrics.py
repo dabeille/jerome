@@ -167,3 +167,33 @@ def test_spy_buy_hold_return_too_short_is_zero():
     curve = _curve([1000])
     spy_bars = pd.DataFrame({"close": [400.0]}, index=curve.index)
     assert metrics.spy_buy_hold_return(spy_bars, curve) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# report: restated Phase-1 frequency gate (P4)
+# ---------------------------------------------------------------------------
+
+
+def test_funnel_section_renders_restated_gate_legs():
+    from backtest import report
+
+    curve = _curve([1000, 1010, 1020, 1030, 1040])   # 5 trading days
+    funnel = {"signals_generated": 10, "filled": 4}
+    lines = report._funnel_section(funnel, TRADES, curve)   # 4 trades / 5 days
+    text = "\n".join(lines)
+    # signals/day = 10/5 = 2.0 >= 1 -> PASS
+    assert "Gated signals/day 2.000 vs Phase-1 gate >=1/day: PASS" in text
+    # fills/week = 0.8 * 5 = 4.0 >= 2 -> PASS
+    assert "Fills/week 4.00 vs Phase-1 gate >=2/week: PASS" in text
+    assert "Max drawdown" in text
+
+
+def test_funnel_section_gate_legs_fail_when_sparse():
+    from backtest import report
+
+    curve = _curve([1000] * 9 + [1010])   # 10 trading days, 1 trade
+    funnel = {"signals_generated": 3, "filled": 1}
+    lines = report._funnel_section(funnel, [TRADE_A], curve)
+    text = "\n".join(lines)
+    assert "Gated signals/day 0.300 vs Phase-1 gate >=1/day: FAIL" in text
+    assert "Fills/week 0.50 vs Phase-1 gate >=2/week: FAIL" in text

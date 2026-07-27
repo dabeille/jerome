@@ -61,8 +61,12 @@ def _candidate(sym: str, df: pd.DataFrame, bench_ret: float) -> dict | None:
     }
 
 
-def scan(bars: dict[str, pd.DataFrame]) -> list[Signal]:
-    """bars: symbol -> daily OHLCV DataFrame (ascending dates)."""
+def scan(bars: dict[str, pd.DataFrame], target_r: float = TARGET_R) -> list[Signal]:
+    """bars: symbol -> daily OHLCV DataFrame (ascending dates).
+
+    ``target_r`` overrides the take-profit distance (target = entry +
+    target_r * risk) for backtest tuning; the module default matches live.
+    """
     bench_df = bars.get(BENCHMARK)
     if bench_df is None or len(bench_df) < MIN_BARS:
         return []
@@ -86,7 +90,7 @@ def scan(bars: dict[str, pd.DataFrame]) -> list[Signal]:
         if c["rs"] < rs_cutoff:
             continue
         entry, stop = c["entry"], c["stop"]
-        target = entry + TARGET_R * (entry - stop)
+        target = entry + target_r * (entry - stop)
         score = round(min(100.0, max(0.0,
             50.0 * (c["relvol"] / RELVOL_MULT) + 500.0 * max(c["rs"], 0.0)
         )), 1)

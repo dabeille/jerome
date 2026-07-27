@@ -38,12 +38,38 @@ def main() -> None:
                         help="starting equity (default: $%(default)s)")
     parser.add_argument("--report", default=None, metavar="PATH",
                         help="report path (default: data/backtest_report.md)")
+    # --- 0.5.3 tuning knobs (default = live behaviour) ---
+    parser.add_argument("--fractional", action="store_true",
+                        help="allow sub-share sizing (backtest-only; live uses "
+                             "whole-share Alpaca brackets)")
+    parser.add_argument("--target-r", type=float, default=None, metavar="R",
+                        help="momentum take-profit distance in R (default: 3.0)")
+    parser.add_argument("--time-stop", type=int, default=None, metavar="N",
+                        help="force-exit a position after N trading days if no "
+                             "bracket leg fired (default: off)")
+    parser.add_argument("--max-positions", type=int, default=None, metavar="N",
+                        help="override MAX_OPEN_POSITIONS / MAX_TRADES_PER_DAY "
+                             "(default: config = 3 / 3)")
+    parser.add_argument("--no-meanrev", action="store_true",
+                        help="run momentum only")
     args = parser.parse_args()
+
+    kwargs: dict = {}
+    if args.target_r is not None:
+        kwargs["target_r"] = args.target_r
+    if args.max_positions is not None:
+        kwargs["max_open_positions"] = args.max_positions
+        kwargs["max_trades_per_day"] = args.max_positions
+    if args.no_meanrev:
+        kwargs["strategies"] = ("momentum",)
 
     try:
         result = run_backtest(args.start, args.end, strict=args.strict,
                               resume_after_days=args.resume_after,
-                              starting_equity=args.equity)
+                              starting_equity=args.equity,
+                              fractional=args.fractional,
+                              time_stop_days=args.time_stop,
+                              **kwargs)
     except RuntimeError as e:
         raise SystemExit(str(e))
 

@@ -13,13 +13,18 @@ import pandas as pd
 from backtest import metrics
 from backtest.engine import BacktestResult, HaltEvent, Trade
 
-PHASE1_TRADES_PER_DAY = (1.0, 3.0)
+# Phase-1 gate (restated per findings P4): frequency is measured as gated
+# signals surfacing in the journal plus actual fills, not raw trades/day.
+PHASE1_MIN_SIGNALS_PER_DAY = 1.0   # gated signals surfacing in the journal
+PHASE1_MIN_FILLS_PER_WEEK = 2.0    # "≥2–3 fills/week" — 2 is the pass floor
 PHASE1_MAX_DRAWDOWN = 0.25
 
 _PARAM_LABELS = [
     ("start", "Window start"), ("end", "Window end"),
     ("starting_equity", "Starting equity"),
     ("resume_after_days", "Resume after (days)"), ("strict", "Strict data gate"),
+    ("fractional", "Fractional shares"), ("time_stop_days", "Time-stop (days)"),
+    ("strategies", "Strategies"),
     ("risk_per_trade", "Risk per trade"), ("max_position_pct", "Max position %"),
     ("max_open_positions", "Max open positions"), ("max_per_sector", "Max per sector"),
     ("daily_loss_limit", "Daily loss limit"), ("drawdown_halt", "Drawdown halt"),
@@ -130,11 +135,19 @@ def _funnel_section(funnel: dict[str, int], trades: list[Trade],
     lines.append("")
 
     cs = metrics.curve_stats(trades, equity_curve)
-    lo, hi = PHASE1_TRADES_PER_DAY
-    gate_ok = lo <= cs.trades_per_day <= hi
+    signals_per_day = (
+        funnel.get("signals_generated", 0) / cs.trading_days if cs.trading_days else 0.0
+    )
     lines.append(
-        f"- Trades/day {cs.trades_per_day:.3f} vs Phase-1 gate {lo:.0f}-{hi:.0f}/day: "
-        f"{'PASS' if gate_ok else 'FAIL'}"
+        f"- Gated signals/day {signals_per_day:.3f} vs Phase-1 gate "
+        f">={PHASE1_MIN_SIGNALS_PER_DAY:.0f}/day: "
+        f"{'PASS' if signals_per_day >= PHASE1_MIN_SIGNALS_PER_DAY else 'FAIL'}"
+    )
+    fills_per_week = cs.trades_per_day * 5
+    lines.append(
+        f"- Fills/week {fills_per_week:.2f} vs Phase-1 gate "
+        f">={PHASE1_MIN_FILLS_PER_WEEK:.0f}/week: "
+        f"{'PASS' if fills_per_week >= PHASE1_MIN_FILLS_PER_WEEK else 'FAIL'}"
     )
     dd_ok = abs(cs.max_drawdown) < PHASE1_MAX_DRAWDOWN
     lines.append(
