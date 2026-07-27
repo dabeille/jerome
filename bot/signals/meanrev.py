@@ -27,8 +27,13 @@ def rsi(series: pd.Series, period: int = 2) -> pd.Series:
     return 100 - 100 / (1 + rs)
 
 
-def scan(bars: dict[str, pd.DataFrame]) -> list[Signal]:
-    """bars: symbol -> daily OHLCV DataFrame (ascending dates)."""
+def scan(bars: dict[str, pd.DataFrame], rsi_oversold: float = RSI_OVERSOLD,
+         stop_pct: float = STOP_PCT) -> list[Signal]:
+    """bars: symbol -> daily OHLCV DataFrame (ascending dates).
+
+    ``rsi_oversold`` (dip-buy threshold) and ``stop_pct`` (hard-stop distance)
+    override the module defaults for backtest tuning; defaults match live.
+    """
     signals = []
     for sym, df in bars.items():
         if len(df) < MIN_BARS:
@@ -44,15 +49,15 @@ def scan(bars: dict[str, pd.DataFrame]) -> list[Signal]:
             continue  # not in an uptrend
 
         rsi2 = rsi(close, RSI_PERIOD).iloc[-1]
-        if pd.isna(rsi2) or rsi2 >= RSI_OVERSOLD:
+        if pd.isna(rsi2) or rsi2 >= rsi_oversold:
             continue  # not oversold enough
 
         sma_exit = close.rolling(SMA_EXIT).mean().iloc[-1]
         entry = float(last_close)
-        stop = entry * (1 - STOP_PCT)
+        stop = entry * (1 - stop_pct)
         target = float(sma_exit) if not pd.isna(sma_exit) and sma_exit > entry else entry * 1.03
 
-        score = round(min(100.0, max(0.0, (RSI_OVERSOLD - rsi2) / RSI_OVERSOLD * 100.0)), 1)
+        score = round(min(100.0, max(0.0, (rsi_oversold - rsi2) / rsi_oversold * 100.0)), 1)
         signals.append(Signal(
             symbol=sym,
             side="buy",
@@ -62,7 +67,7 @@ def scan(bars: dict[str, pd.DataFrame]) -> list[Signal]:
             target=target,
             strategy="meanrev",
             reasoning=(
-                f"RSI(2) {rsi2:.1f} < {RSI_OVERSOLD} while close above "
+                f"RSI(2) {rsi2:.1f} < {rsi_oversold} while close above "
                 f"{SMA_TREND}d SMA (uptrend dip-buy)"
             ),
         ))

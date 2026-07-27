@@ -41,11 +41,11 @@ class Trade:
     entry: float
     exit_date: str = ""
     exit: float = 0.0
-    qty: int = 0
+    qty: float = 0  # float so fractional-share backtests round-trip; int in live mode
     strategy: str = ""
     stop: float = 0.0
     target: float = 0.0
-    exit_reason: str = ""  # "stop" | "target" | "eod" | "halt"
+    exit_reason: str = ""  # "stop" | "target" | "time" | "eod" | "halt"
 
     @property
     def pnl(self) -> float:
@@ -57,17 +57,18 @@ class Position:
     symbol: str
     entry_date: str
     entry: float
-    qty: int
+    qty: float
     stop: float
     target: float
     strategy: str
+    days_held: int = 0  # trading days since entry, for the time-stop
 
 
 @dataclass
 class _Pending:
     """A gated signal queued on day t, filled at day t+1's open."""
     signal: Signal
-    qty: int
+    qty: float
 
 
 @dataclass
@@ -88,9 +89,20 @@ class BacktestResult:
     params: dict = field(default_factory=dict)
 
 
+STRATEGIES = ("momentum", "meanrev")
+
+
 def run_backtest(start: str, end: str, strict: bool = False,
                  resume_after_days: int | None = None,
-                 starting_equity: float = STARTING_EQUITY) -> BacktestResult:
+                 starting_equity: float = STARTING_EQUITY,
+                 fractional: bool = False,
+                 target_r: float = momentum.TARGET_R,
+                 rsi_oversold: float = meanrev.RSI_OVERSOLD,
+                 meanrev_stop_pct: float = meanrev.STOP_PCT,
+                 max_open_positions: int | None = None,
+                 max_trades_per_day: int | None = None,
+                 time_stop_days: int | None = None,
+                 strategies: tuple[str, ...] = STRATEGIES) -> BacktestResult:
     """Replay the live per-run ordering (signals -> risk gate -> fills) day by
     day over cached bars in ``[start, end]``. No network, no LLM veto layer.
 
@@ -104,6 +116,15 @@ def run_backtest(start: str, end: str, strict: bool = False,
     ``resume_after_days=N`` to model the plan §5 human review: stay flat for
     N trading days, then rebase the high-water mark to that day's equity and
     keep going, mirroring what ``journal.mark_resume()`` does live.
+
+    Tuning knobs (all default to live behaviour, exercised only by 0.5.3
+    sweeps): ``fractional`` allows sub-share sizing; ``target_r`` /
+    ``rsi_oversold`` / ``meanrev_stop_pct`` override the signal thresholds;
+    ``max_open_positions`` / ``max_trades_per_day`` override the slot caps;
+    ``time_stop_days`` force-exits a position at the close once it has been
+    held that many trading days without a bracket leg firing (models §4A's
+    "1-5 day continuation"; broker brackets don't expire, so this is a
+    backtest-only exit); ``strategies`` selects which scanners run.
 
     Returns a BacktestResult (trades, equity_curve, funnel, halts, params).
     """
@@ -142,8 +163,10 @@ def run_backtest(start: str, end: str, strict: bool = False,
         day_start_equity = equity_values[-1] if equity_values else starting_equity
         trades_today = 0
 
-        # 1. Manage open positions / bracket exits against today's bar.
+        # 1. Manage open positions: age each by a trading day, then check its
+        # bracket legs and (if configured) the time-stop against today's bar.
         for sym in list(positions):
+            positions[sym].days_held += 1
             df = bars[sym]
             if t not in df.index:
                 continue
@@ -154,6 +177,10 @@ def run_backtest(start: str, end: str, strict: bool = False,
                 exit_price, reason = pos.stop, "stop"
             elif row["high"] >= pos.target:
                 exit_price, reason = pos.target, "target"
+            elif time_stop_days is not None and pos.days_held >= time_stop_days:
+                # No bracket leg fired within the holding window — close at
+                # today's mark. Bracket exits above take precedence on the day.
+                exit_price, reason = float(row["close"]), "time"
             if exit_price is not None:
                 fill = exit_price * (1 - SLIPPAGE)
                 cash += pos.qty * fill
@@ -259,10 +286,17 @@ def run_backtest(start: str, end: str, strict: bool = False,
         # 6-7. Generate signals off history up to and including today, then
         # gate them and queue approved entries for tomorrow's open.
         sliced = {sym: df.loc[:t] for sym, df in bars.items()}
-        signals: list[Signal] = momentum.scan(sliced) + meanrev.scan(sliced)
+        signals: list[Signal] = []
+        if "momentum" in strategies:
+            signals += momentum.scan(sliced, target_r=target_r)
+        if "meanrev" in strategies:
+            signals += meanrev.scan(sliced, rsi_oversold=rsi_oversold,
+                                    stop_pct=meanrev_stop_pct)
         funnel["signals_generated"] += len(signals)
         approved = risk.gate(signals, equity, list(positions), trades_today,
-                             reject_counts=funnel)
+                             reject_counts=funnel, fractional=fractional,
+                             max_open_positions=max_open_positions,
+                             max_trades_per_day=max_trades_per_day)
         pending = [_Pending(sig, qty) for sig, qty in approved]
 
         equity_dates.append(t)
@@ -283,16 +317,22 @@ def run_backtest(start: str, end: str, strict: bool = False,
             ))
 
     equity_curve = pd.Series(equity_values, index=pd.DatetimeIndex(equity_dates, name="timestamp"))
+    # Record *effective* values so a report is self-describing under tuning:
+    # slot caps fall back to config when not overridden.
+    eff_max_open = config.MAX_OPEN_POSITIONS if max_open_positions is None else max_open_positions
+    eff_max_trades = config.MAX_TRADES_PER_DAY if max_trades_per_day is None else max_trades_per_day
     params = dict(
         start=start, end=end, strict=strict,
         starting_equity=starting_equity, resume_after_days=resume_after_days,
+        fractional=fractional, time_stop_days=time_stop_days,
+        strategies=",".join(strategies),
         risk_per_trade=config.RISK_PER_TRADE, max_position_pct=config.MAX_POSITION_PCT,
-        max_open_positions=config.MAX_OPEN_POSITIONS, max_per_sector=config.MAX_PER_SECTOR,
+        max_open_positions=eff_max_open, max_per_sector=config.MAX_PER_SECTOR,
         daily_loss_limit=config.DAILY_LOSS_LIMIT, drawdown_halt=config.DRAWDOWN_HALT,
-        max_trades_per_day=config.MAX_TRADES_PER_DAY,
+        max_trades_per_day=eff_max_trades,
         relvol_mult=momentum.RELVOL_MULT, rs_top_pct=momentum.RS_TOP_PCT,
-        target_r=momentum.TARGET_R, rsi_oversold=meanrev.RSI_OVERSOLD,
-        stop_pct=meanrev.STOP_PCT,
+        target_r=target_r, rsi_oversold=rsi_oversold,
+        stop_pct=meanrev_stop_pct,
     )
     return BacktestResult(trades=trades, equity_curve=equity_curve,
                           funnel=dict(funnel), halts=halts, params=params)

@@ -12,14 +12,21 @@ def kill_switch_active() -> bool:
     return config.KILL_FILE.exists()
 
 
-def position_size(equity: float, sig: Signal) -> int:
+def position_size(equity: float, sig: Signal, fractional: bool = False) -> float:
     """Shares such that (entry - stop) * shares ≈ RISK_PER_TRADE * equity,
-    capped by MAX_POSITION_PCT of equity. Returns 0 if untradeable."""
+    capped by MAX_POSITION_PCT of equity. Returns 0 if untradeable.
+
+    ``fractional`` is a backtest-only knob (Alpaca bracket orders — the live
+    path — require whole-share quantities, see broker.submit_bracket): when
+    set, the whole-share truncation is skipped and a float quantity is
+    returned. The default keeps the integer behaviour the live bot relies on.
+    """
     if sig.risk_per_share <= 0 or sig.entry <= 0:
         return 0
     by_risk = (equity * config.RISK_PER_TRADE) / sig.risk_per_share
     by_size = (equity * config.MAX_POSITION_PCT) / sig.entry
-    return max(int(min(by_risk, by_size)), 0)
+    raw = min(by_risk, by_size)
+    return max(raw if fractional else int(raw), 0)
 
 
 def daily_loss_breached(equity_now: float) -> bool:
@@ -33,18 +40,30 @@ def drawdown_breached(equity_now: float) -> bool:
     return hwm > 0 and (equity_now - hwm) / hwm <= config.DRAWDOWN_HALT
 
 
+MIN_NOTIONAL = 1.0  # Alpaca's real minimum order value; the fractional floor
+
+
 def gate(signals: list[Signal], equity: float,
          open_positions: list[str], trades_today: int,
-         reject_counts: dict[str, int] | None = None) -> list[tuple[Signal, int]]:
+         reject_counts: dict[str, int] | None = None,
+         fractional: bool = False,
+         max_open_positions: int | None = None,
+         max_trades_per_day: int | None = None) -> list[tuple[Signal, float]]:
     """Return (signal, qty) pairs that pass all checks, best score first.
 
     ``reject_counts``, if given, is incremented in place with the reason each
     dropped signal was dropped: vetoed, already_held, size_zero, sector_cap,
     slots_full. Default None leaves gate()'s behaviour unchanged.
+
+    ``fractional`` (backtest-only, see position_size) allows sub-share
+    quantities; a signal is then only size-zero below Alpaca's $1 minimum
+    notional. ``max_open_positions`` / ``max_trades_per_day`` override the
+    config constants for backtest tuning sweeps; None uses config as before.
     """
-    approved: list[tuple[Signal, int]] = []
-    slots = min(config.MAX_OPEN_POSITIONS - len(open_positions),
-                config.MAX_TRADES_PER_DAY - trades_today)
+    max_open = config.MAX_OPEN_POSITIONS if max_open_positions is None else max_open_positions
+    max_trades = config.MAX_TRADES_PER_DAY if max_trades_per_day is None else max_trades_per_day
+    approved: list[tuple[Signal, float]] = []
+    slots = min(max_open - len(open_positions), max_trades - trades_today)
     sector_counts: dict[str, int] = {}
     for sym in open_positions:
         sec = sectors.sector_of(sym)
@@ -69,8 +88,9 @@ def gate(signals: list[Signal], equity: float,
             if reject_counts is not None:
                 reject_counts["already_held"] = reject_counts.get("already_held", 0) + 1
             continue
-        qty = position_size(equity, sig)
-        if qty < 1:
+        qty = position_size(equity, sig, fractional=fractional)
+        too_small = (qty * sig.entry < MIN_NOTIONAL) if fractional else (qty < 1)
+        if too_small:
             if reject_counts is not None:
                 reject_counts["size_zero"] = reject_counts.get("size_zero", 0) + 1
             continue

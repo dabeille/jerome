@@ -20,6 +20,8 @@ _PARAM_LABELS = [
     ("start", "Window start"), ("end", "Window end"),
     ("starting_equity", "Starting equity"),
     ("resume_after_days", "Resume after (days)"), ("strict", "Strict data gate"),
+    ("fractional", "Fractional shares"), ("time_stop_days", "Time-stop (days)"),
+    ("strategies", "Strategies"),
     ("risk_per_trade", "Risk per trade"), ("max_position_pct", "Max position %"),
     ("max_open_positions", "Max open positions"), ("max_per_sector", "Max per sector"),
     ("daily_loss_limit", "Daily loss limit"), ("drawdown_halt", "Drawdown halt"),

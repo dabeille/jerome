@@ -179,7 +179,9 @@ def _bars(dates, sym_rows: list[dict]) -> dict[str, pd.DataFrame]:
 
 
 def _scan_signal_once(day, sig):
-    def _scan(bars_dict):
+    # **kwargs absorbs the engine's tuning knobs (target_r/rsi_oversold/...) —
+    # these stubs replace the real scanners to isolate fill/halt mechanics.
+    def _scan(bars_dict, **kwargs):
         df = bars_dict.get("SYM")
         if df is not None and len(df) and df.index[-1] == day:
             return [sig]
@@ -187,12 +189,12 @@ def _scan_signal_once(day, sig):
     return _scan
 
 
-def _scan_none(bars_dict):
+def _scan_none(bars_dict, **kwargs):
     return []
 
 
 def _gate_fixed_qty(qty):
-    def _gate(signals, equity, open_positions, trades_today, reject_counts=None):
+    def _gate(signals, equity, open_positions, trades_today, **kwargs):
         return [(signals[0], qty)] if signals else []
     return _gate
 
@@ -301,3 +303,70 @@ def test_size_zero_signal_produces_no_trade(monkeypatch):
 
     assert result.funnel.get("size_zero") == 1
     assert result.trades == []
+
+
+def test_fractional_fills_the_size_zero_signal(monkeypatch):
+    # Same $500-entry signal that size_zero-drops above; with fractional=True
+    # it fills 0.8 shares (MAX_POSITION_PCT 40% of $1k / $500) through the real
+    # risk.gate — so we exercise the true sizing path, not a stub.
+    dates = pd.bdate_range("2024-01-02", periods=2)
+    sym_rows = [
+        dict(open=500.0, high=505.0, low=495.0, close=500.0),
+        dict(open=500.0, high=505.0, low=495.0, close=500.0),
+    ]
+    bars = _bars(dates, sym_rows)
+    sig = Signal(symbol="SYM", side="buy", score=50.0, entry=500.0,
+                stop=490.0, target=550.0, strategy="momentum")
+
+    monkeypatch.setattr(data, "get_daily_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(engine.momentum, "scan", _scan_signal_once(dates[0], sig))
+    monkeypatch.setattr(engine.meanrev, "scan", _scan_none)
+
+    result = engine.run_backtest(dates[0].strftime("%Y-%m-%d"), dates[-1].strftime("%Y-%m-%d"),
+                                 fractional=True)
+
+    assert result.funnel.get("size_zero", 0) == 0
+    assert len(result.trades) == 1
+    assert result.trades[0].qty == pytest.approx(0.8)
+
+
+def test_time_stop_exits_on_the_right_day(monkeypatch):
+    # Flat price so no bracket leg fires; time_stop_days=2 must close the
+    # position at the close of the 2nd trading day it's held.
+    dates = pd.bdate_range("2024-01-02", periods=5)
+    flat = dict(open=100.0, high=101.0, low=99.0, close=100.0)
+    bars = _bars(dates, [flat] * 5)
+    sig = Signal(symbol="SYM", side="buy", score=50.0, entry=100.0,
+                stop=1.0, target=1000.0, strategy="momentum")  # bracket never hit
+
+    monkeypatch.setattr(data, "get_daily_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(engine.momentum, "scan", _scan_signal_once(dates[0], sig))
+    monkeypatch.setattr(engine.meanrev, "scan", _scan_none)
+    monkeypatch.setattr(engine.risk, "gate", _gate_fixed_qty(5))
+
+    result = engine.run_backtest(dates[0].strftime("%Y-%m-%d"), dates[-1].strftime("%Y-%m-%d"),
+                                 time_stop_days=2)
+
+    sym_trades = [t for t in result.trades if t.symbol == "SYM"]
+    assert len(sym_trades) == 1
+    trade = sym_trades[0]
+    assert trade.exit_reason == "time"
+    # Signal d0, fill d1, aged on d2 (held 1) and d3 (held 2 -> exit at d3 close).
+    assert trade.exit_date == str(dates[3].date())
+
+
+def test_strategies_selection_skips_meanrev(monkeypatch):
+    dates = pd.bdate_range("2024-01-02", periods=2)
+    bars = _bars(dates, [dict(open=100.0, high=101.0, low=99.0, close=100.0)] * 2)
+
+    def _boom(bars_dict, **kwargs):
+        raise AssertionError("meanrev.scan must not run when excluded")
+
+    monkeypatch.setattr(data, "get_daily_bars", lambda *a, **k: bars)
+    monkeypatch.setattr(engine.momentum, "scan", _scan_none)
+    monkeypatch.setattr(engine.meanrev, "scan", _boom)
+
+    # Must not raise — meanrev is excluded, so _boom is never called.
+    result = engine.run_backtest(dates[0].strftime("%Y-%m-%d"), dates[-1].strftime("%Y-%m-%d"),
+                                 strategies=("momentum",))
+    assert result.params["strategies"] == "momentum"
