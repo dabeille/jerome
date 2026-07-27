@@ -5,10 +5,11 @@ An experiment: 1–3 stock/ETF trades/day on a small account, quant signals with
 ## Layout
 
 ```
-bot/            trading logic (config, data, signals/, risk, broker, journal)
+bot/            trading logic (config, data, signals/, risk, broker, alerts, journal)
 backtest/       daily-bar backtest engine (shares code with the live bot)
-scripts/        smoke_test.py — verify keys/connectivity (paper only)
+scripts/        smoke_test, heartbeat_check, snapshot_chains, refresh_universe, ...
 data/           cached bars + journal.db (gitignored)
+data/public/    dashboard.html — the only directory the LAN server exposes
 KILL            touch this file to cancel all orders, liquidate, and halt
 dashboard.md    regenerated each run (gitignored)
 ```
@@ -64,13 +65,53 @@ Cron (`crontab -e`) — `CRON_TZ` keeps schedules in market time year-round;
 
 ```cron
 CRON_TZ=America/New_York
-0  9  * * 1-5  cd /home/pi/jerome && flock -n /tmp/bot.lock .venv/bin/python -m bot.main morning >> data/cron.log 2>&1
-30 12 * * 1-5  cd /home/pi/jerome && flock -n /tmp/bot.lock .venv/bin/python -m bot.main midday  >> data/cron.log 2>&1
-45 15 * * 1-5  cd /home/pi/jerome && flock -n /tmp/bot.lock .venv/bin/python -m bot.main close   >> data/cron.log 2>&1
+0  9  * * 1-5  cd /home/pi/jerome && flock -n /tmp/bot.lock .venv/bin/python -m bot.main morning        >> data/cron.log 2>&1
+30 12 * * 1-5  cd /home/pi/jerome && flock -n /tmp/bot.lock .venv/bin/python -m bot.main midday         >> data/cron.log 2>&1
+45 15 * * 1-5  cd /home/pi/jerome && flock -n /tmp/bot.lock .venv/bin/python -m bot.main close          >> data/cron.log 2>&1
+0  10 * * 1-5  cd /home/pi/jerome && flock -n /tmp/hb.lock   .venv/bin/python -m scripts.heartbeat_check >> data/cron.log 2>&1
+15 16 * * 1-5  cd /home/pi/jerome && flock -n /tmp/chain.lock .venv/bin/python -m scripts.snapshot_chains >> data/cron.log 2>&1
+0  8  * * 0    cd /home/pi/jerome && flock -n /tmp/uni.lock   .venv/bin/python -m scripts.refresh_universe >> data/cron.log 2>&1
 ```
 
-(Market holidays: the bot should no-op via the broker calendar — TODO step
-1.1.3 adds an `is_market_open` check at the top of `run()`.)
+Market holidays: the three session runs no-op automatically — `run()` checks
+Alpaca's trading calendar (`broker.is_trading_day()`) right after the kill
+switch and exits early on non-trading days. Half-days need no special handling.
+
+The extra cron lines: `heartbeat_check` (10:00 ET) pages you if the morning run
+never journaled an equity snapshot on a trading day — i.e. cron itself failed;
+`snapshot_chains` (16:15 ET, after the close) banks EOD option-chain snapshots;
+`refresh_universe` (Sunday) rebuilds the dynamic tier.
+
+## LAN dashboard
+
+Each run also renders `data/public/dashboard.html` (account header, an inline-SVG
+equity sparkline, open positions, the last signal-funnel row, recent decisions).
+Serve it read-only from the Pi over the LAN with a static file server — no
+dynamic code touches the DB, and **only `data/public/` is exposed, never `data/`
+itself** (so `journal.db` and cached data stay unreachable):
+
+```ini
+# /etc/systemd/system/bot-dashboard.service
+[Unit]
+Description=Bot LAN dashboard (static)
+After=network.target
+[Service]
+User=pi
+WorkingDirectory=/home/pi/jerome
+ExecStart=/usr/bin/python3 -m http.server 8080 --directory data/public --bind 0.0.0.0
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now bot-dashboard
+sudo ufw allow from <your-LAN-subnet> to any port 8080   # LAN only, same pattern as port 22
+```
+
+Then browse `http://<pi-lan-ip>:8080/dashboard.html` from any device on your
+network. The page auto-refreshes every 5 minutes. Sanity check: `curl
+http://<pi-lan-ip>:8080/journal.db` must 404 — only `data/public/` is served.
 
 ## Security
 
@@ -101,7 +142,12 @@ Threat model: a box on your home network holding API keys that can trade
 - Run the bot as a dedicated non-sudo user; the repo and `.env` owned by it.
 - Don't co-host other services (media servers, etc.) on this Pi — every
   extra service is attack surface next to your trading keys.
-- Read `dashboard.md` by SSHing in, not by exposing a web server.
+- The one deliberate inbound exception is the **LAN dashboard** (above): a
+  read-only static file server bound to the LAN and firewalled with `ufw` to
+  your subnet only. It serves `data/public/` exclusively — never `data/`, so
+  `journal.db` and cached data stay off the wire. No dynamic code, no DB
+  access, no writes: a viewer can read the rendered HTML and nothing else. For
+  anything not on the dashboard, read the journal by SSHing in.
 - Physical: anyone with the SD card has the keys. Home setting = acceptable
   risk given keys can't withdraw; rotate keys if the Pi is ever
   lost/stolen/resold, and wipe the card before disposal.
