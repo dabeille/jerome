@@ -32,7 +32,8 @@ TRAIN_END = "2023-12-31"
 CONTROL_START = "2022-06-01"  # recent-regime control, still inside the guard
 GUARD_END = pd.Timestamp("2023-12-31")
 
-# Phase-1 gate thresholds, mirrored from backtest.report.
+# Historical gate thresholds used by the banked 0.5.3 sweep; the current
+# Phase-1 gate (restated per findings P4) lives in backtest.report constants.
 GATE_TRADES_PER_DAY = (1.0, 3.0)
 GATE_MAX_DRAWDOWN = 0.25
 
