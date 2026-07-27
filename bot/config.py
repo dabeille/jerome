@@ -33,6 +33,15 @@ else:
 FINNHUB_KEY = os.getenv("FINNHUB_KEY", "")
 ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# --- Alerts (Resend email, plan 1.1.4) -------------------------------------
+# Failure alerts only — an alert path must never crash a trading run, so
+# alerts.py fails open (stderr warning + no-op) if these are unset.
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "")
+# resend.dev's shared sender delivers to the account owner without any domain
+# setup; swap for your own verified domain later if you want nicer From lines.
+ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM", "onboarding@resend.dev")
 LLM_MODEL = "claude-opus-4-8"   # analyst veto/conviction call (plan §4C)
 LLM_MAX_TOKENS = 1024           # small JSON verdict object, one call/run
 
@@ -54,8 +63,13 @@ EARNINGS_DIR = DATA_DIR / "earnings"  # cached earnings calendar, one JSON per d
 JOURNAL_DB = DATA_DIR / "journal.db"
 KILL_FILE = ROOT / "KILL"            # touch this file to halt + liquidate
 DASHBOARD = ROOT / "dashboard.md"
+# LAN dashboard: only data/public/ is ever served (see README) — never data/
+# itself, which holds journal.db and other private files.
+PUBLIC_DIR = DATA_DIR / "public"
+DASHBOARD_HTML = PUBLIC_DIR / "dashboard.html"
+CHAINS_DIR = DATA_DIR / "chains"     # EOD option-chain snapshots (plan 1.2.5)
 
-for d in (DATA_DIR, BARS_DIR, NEWS_DIR, EARNINGS_DIR):
+for d in (DATA_DIR, BARS_DIR, NEWS_DIR, EARNINGS_DIR, PUBLIC_DIR, CHAINS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 # --- Universe (two tiers) -----------------------------------------------------
@@ -97,6 +111,14 @@ def _load_dynamic_universe() -> "list[str]":
 DYNAMIC_STOCKS = _load_dynamic_universe()
 STOCK_UNIVERSE = CORE_STOCKS + DYNAMIC_STOCKS
 UNIVERSE = ETF_UNIVERSE + STOCK_UNIVERSE
+
+# --- Options-chain snapshots (plan 1.2.5) -----------------------------------
+# Collection only in Phase 1 — no strategy reads this yet; we build IV history
+# ahead of the options Addendum. Liquid, tight-spread underlyings only.
+OPTION_UNDERLYINGS = [
+    "SPY", "QQQ", "IWM", "SMH", "XBI",
+    "AAPL", "NVDA", "TSLA", "AMD", "META", "AMZN",
+]
 
 
 def validate() -> None:

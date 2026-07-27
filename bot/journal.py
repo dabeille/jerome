@@ -4,6 +4,8 @@ SQLite (stdlib, zero deps, fine on a Pi's SD card) + a human-readable
 dashboard.md regenerated after each run.
 """
 
+import html
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -23,6 +25,9 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE TABLE IF NOT EXISTS equity (
     ts TEXT, equity REAL, cash REAL, note TEXT
+);
+CREATE TABLE IF NOT EXISTS funnel (
+    ts TEXT, run TEXT, payload TEXT
 );
 """
 
@@ -63,6 +68,49 @@ def log_equity(equity: float, cash: float, note: str = "") -> None:
     with _conn() as c:
         c.execute("INSERT INTO equity VALUES (?,?,?,?)",
                   (_now(), equity, cash, note))
+
+
+def log_funnel(run: str, payload: dict) -> None:
+    """One signal-attrition row per live run (plan 1.1.5), so the live funnel
+    is directly comparable to the backtest's. ``payload`` is the run's
+    signals-in / drops-by-reason / approved counts, stored as JSON."""
+    with _conn() as c:
+        c.execute("INSERT INTO funnel VALUES (?,?,?)",
+                  (_now(), run, json.dumps(payload, sort_keys=True)))
+
+
+def last_funnel() -> tuple[str, str, dict] | None:
+    """Most recent (ts, run, payload_dict) funnel row, or None."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT ts, run, payload FROM funnel ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+    if not row:
+        return None
+    return row[0], row[1], json.loads(row[2])
+
+
+def equity_series(limit: int = 60) -> list[tuple[str, float]]:
+    """Last ``limit`` (ts, equity) snapshots in chronological order, excluding
+    the resume markers (which repeat the resume-day equity as bookkeeping)."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT ts, equity FROM equity WHERE note != ? "
+            "ORDER BY ts DESC LIMIT ?",
+            (RESUME_NOTE, limit),
+        ).fetchall()
+    return list(reversed(rows))
+
+
+def recent_decision_rows(limit: int = 15) -> list[tuple]:
+    """Most recent (ts, run, symbol, strategy, action, reasoning) rows,
+    newest first, for the dashboard."""
+    with _conn() as c:
+        return c.execute(
+            "SELECT ts, run, symbol, strategy, action, reasoning "
+            "FROM decisions ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
 
 
 def high_water_mark() -> float:
@@ -115,3 +163,98 @@ def write_dashboard(account_summary: str, positions_summary: str,
         f"## Open positions\n\n{positions_summary}\n\n"
         f"## Recent decisions\n\n{recent_decisions}\n"
     )
+
+
+def _sparkline_svg(points: list[tuple[str, float]], width: int = 640,
+                   height: int = 120) -> str:
+    """Inline SVG equity sparkline from (ts, equity) points. Stdlib only —
+    no plotting dependency (the Pi serves this as a static file)."""
+    values = [v for _, v in points]
+    if len(values) < 2:
+        return '<p class="muted">(not enough equity history yet)</p>'
+    lo, hi = min(values), max(values)
+    span = hi - lo or 1.0
+    pad = 6
+    n = len(values)
+    coords = []
+    for i, v in enumerate(values):
+        x = pad + i * (width - 2 * pad) / (n - 1)
+        y = height - pad - (v - lo) / span * (height - 2 * pad)
+        coords.append(f"{x:.1f},{y:.1f}")
+    up = values[-1] >= values[0]
+    color = "#2e7d32" if up else "#c62828"
+    return (
+        f'<svg viewBox="0 0 {width} {height}" width="100%" '
+        f'preserveAspectRatio="none" role="img" aria-label="equity curve">'
+        f'<polyline fill="none" stroke="{color}" stroke-width="2" '
+        f'points="{" ".join(coords)}" /></svg>'
+    )
+
+
+def _html_table(headers: list[str], rows: list[tuple]) -> str:
+    if not rows:
+        return '<p class="muted">(none)</p>'
+    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{html.escape(str(cell))}</td>" for cell in row) + "</tr>"
+        for row in rows
+    )
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def write_dashboard_html(account_summary: str,
+                         positions: list[tuple]) -> None:
+    """Render data/public/dashboard.html for the LAN dashboard (plan 2d).
+
+    ``positions`` is a list of (symbol, qty, avg_price, unrealized_pl). The
+    equity sparkline, recent decisions, and last funnel row are read from the
+    journal here. Only data/public/ is ever served — never data/ itself."""
+    spark = _sparkline_svg(equity_series())
+    pos_table = _html_table(
+        ["Symbol", "Qty", "Avg entry", "Unrealized P&L"], positions)
+    dec_table = _html_table(
+        ["Time (UTC)", "Run", "Symbol", "Strategy", "Action", "Reasoning"],
+        recent_decision_rows(),
+    )
+    funnel = last_funnel()
+    if funnel:
+        f_ts, f_run, f_payload = funnel
+        items = "".join(
+            f"<li>{html.escape(str(k))}: {html.escape(str(v))}</li>"
+            for k, v in sorted(f_payload.items())
+        )
+        funnel_html = (
+            f'<p class="muted">{html.escape(f_ts)} · {html.escape(f_run)}</p>'
+            f"<ul>{items}</ul>"
+        )
+    else:
+        funnel_html = '<p class="muted">(no funnel row yet)</p>'
+
+    doc = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="300">
+<title>Bot dashboard</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 900px;
+          padding: 0 1rem; color: #1a1a1a; }}
+  h1 {{ font-size: 1.3rem; }} h2 {{ font-size: 1rem; margin-top: 1.8rem; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: 0.85rem; }}
+  th, td {{ text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid #eee; }}
+  .muted {{ color: #888; font-size: 0.85rem; }}
+  .card {{ border: 1px solid #eee; border-radius: 8px; padding: 1rem; }}
+</style></head><body>
+<h1>Bot dashboard <span class="muted">— {html.escape(_now())} · mode {html.escape(config.MODE)}</span></h1>
+<h2>Account</h2>
+<p>{html.escape(account_summary)}</p>
+<h2>Equity</h2>
+<div class="card">{spark}</div>
+<h2>Open positions</h2>
+{pos_table}
+<h2>Signal funnel (last run)</h2>
+{funnel_html}
+<h2>Recent decisions</h2>
+{dec_table}
+</body></html>
+"""
+    config.DASHBOARD_HTML.write_text(doc)
