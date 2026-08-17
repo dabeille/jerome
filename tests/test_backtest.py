@@ -11,6 +11,7 @@ import pytest
 
 from backtest import engine
 from bot import data
+from bot.signals import momentum
 from bot.signals import Signal
 
 WARMUP = 44  # bars before the breakout day; momentum needs MIN_BARS=40
@@ -61,10 +62,16 @@ def _momentum_setup(tail_rows: list[dict]) -> tuple[dict[str, pd.DataFrame], pd.
     return {"SPY": spy, "MOM": mom}, dates
 
 
-# Breakout day: entry=60.0, stop=swing_low=49.5, target=entry+3*(entry-stop)=91.5
+# Breakout day closes at 60.0. The live order is a marketable limit
+# ENTRY_BUFFER above that close, so entry=60.3, stop=swing_low=49.5, and
+# target=entry+3*(entry-stop)=92.7.
 STOP = 49.5
-TARGET = 91.5
-FILL_DAY = dict(open=62.0, high=63.0, low=61.0, close=62.0, volume=1_000_000)
+ENTRY_LIMIT = 60.0 * (1 + momentum.ENTRY_BUFFER)
+TARGET = ENTRY_LIMIT + 3 * (ENTRY_LIMIT - STOP)
+# Fill day trades down through the limit, so the entry fills at the open.
+FILL_DAY = dict(open=59.0, high=63.0, low=58.0, close=62.0, volume=1_000_000)
+# Gap-away day: opens and stays above the limit all day, so nothing fills.
+GAP_AWAY_DAY = dict(open=62.0, high=63.0, low=61.0, close=62.0, volume=1_000_000)
 
 
 def _run(monkeypatch, bars, dates, **kwargs):
@@ -109,8 +116,34 @@ def test_entry_fills_next_day_open_not_signal_day_close(monkeypatch):
     trades, _ = _run(monkeypatch, bars, dates)
 
     trade = _mom_trade(trades)
-    assert trade.entry == pytest.approx(62.0 * (1 + engine.SLIPPAGE))
+    assert trade.entry == pytest.approx(59.0 * (1 + engine.SLIPPAGE))
     assert trade.entry != pytest.approx(60.0)  # not the breakout day's close
+
+
+def test_entry_that_gaps_above_the_limit_never_fills(monkeypatch):
+    """The execution failure the live bot hit in the week of 2026-08-10: the
+    day gaps above the entry limit and never trades back through it, so the
+    order expires unfilled. The engine used to fill at the open regardless,
+    which is why the backtest could not see this cost."""
+    exit_day = dict(open=90.0, high=95.0, low=85.0, close=93.0, volume=1_000_000)
+    bars, dates = _momentum_setup([GAP_AWAY_DAY, exit_day])
+
+    trades, _ = _run(monkeypatch, bars, dates)
+
+    assert [t for t in trades if t.symbol == "MOM"] == []
+
+
+def test_fill_never_pays_more_than_the_limit(monkeypatch):
+    """Opens above the limit but trades back down through it intraday: the
+    limit fills at the limit price, not at the (worse) open."""
+    dip_day = dict(open=61.0, high=61.5, low=58.0, close=60.5, volume=1_000_000)
+    exit_day = dict(open=90.0, high=95.0, low=85.0, close=93.0, volume=1_000_000)
+    bars, dates = _momentum_setup([dip_day, exit_day])
+
+    trades, _ = _run(monkeypatch, bars, dates)
+
+    trade = _mom_trade(trades)
+    assert trade.entry == pytest.approx(ENTRY_LIMIT * (1 + engine.SLIPPAGE))
 
 
 def test_slippage_applied_on_both_sides(monkeypatch):
@@ -120,7 +153,7 @@ def test_slippage_applied_on_both_sides(monkeypatch):
     trades, _ = _run(monkeypatch, bars, dates)
 
     trade = _mom_trade(trades)
-    assert trade.entry == pytest.approx(62.0 * (1 + engine.SLIPPAGE))
+    assert trade.entry == pytest.approx(59.0 * (1 + engine.SLIPPAGE))
     assert trade.exit == pytest.approx(TARGET * (1 - engine.SLIPPAGE))
 
 
@@ -370,3 +403,18 @@ def test_strategies_selection_skips_meanrev(monkeypatch):
     result = engine.run_backtest(dates[0].strftime("%Y-%m-%d"), dates[-1].strftime("%Y-%m-%d"),
                                  strategies=("momentum",))
     assert result.params["strategies"] == "momentum"
+
+
+def test_entry_that_gaps_through_its_stop_is_not_taken(monkeypatch):
+    """A fill at or below the signal's own stop is not a trade the strategy
+    means to take, and it makes the R denominator negative — which is how a
+    parameter sweep once produced +15R of 'expectancy' from one row."""
+    # Opens below the 49.5 swing-low stop, so the limit is touched but the
+    # premise (entry above stop) is already gone.
+    gap_through = dict(open=45.0, high=48.0, low=44.0, close=47.0, volume=1_000_000)
+    exit_day = dict(open=90.0, high=95.0, low=85.0, close=93.0, volume=1_000_000)
+    bars, dates = _momentum_setup([gap_through, exit_day])
+
+    trades, _ = _run(monkeypatch, bars, dates)
+
+    assert [t for t in trades if t.symbol == "MOM"] == []

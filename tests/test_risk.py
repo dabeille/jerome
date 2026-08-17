@@ -306,3 +306,52 @@ def test_kill_switch_active(tmp_path, monkeypatch):
     assert risk.kill_switch_active() is False
     kill_file.touch()
     assert risk.kill_switch_active() is True
+
+
+# ---------------------------------------------------------------------------
+# Buying-power cap (plan §5 "no leverage")
+#
+# MAX_OPEN_POSITIONS (3) x MAX_POSITION_PCT (0.40) permits 120% of equity, so
+# without this check the bot can borrow. MAX_BUYING_POWER_MULT was declared in
+# config and read by nothing until now.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_caps_new_exposure_at_one_times_equity(monkeypatch):
+    monkeypatch.setattr(sectors, "sector_of", lambda sym: None)
+    # entry=100/stop=95 is narrow enough that MAX_POSITION_PCT binds, so each
+    # position is a full 40% of equity and the third would take the book to
+    # 120% — exactly the case config permits and the cap must refuse.
+    sigs = [_signal(symbol=s, entry=100.0, stop=95.0, score=sc)
+            for s, sc in (("AAA", 90), ("BBB", 80), ("CCC", 70))]
+    counts: dict[str, int] = {}
+    approved = risk.gate(sigs, equity=10_000.0, open_positions=[],
+                         trades_today=0, reject_counts=counts)
+
+    notional = sum(qty * sig.entry for sig, qty in approved)
+    assert notional <= 10_000.0
+    assert counts.get("buying_power", 0) >= 1
+
+
+def test_gate_counts_already_held_notional_against_the_cap(monkeypatch):
+    monkeypatch.setattr(sectors, "sector_of", lambda sym: None)
+    counts: dict[str, int] = {}
+    # The book is already fully invested — nothing new may be added.
+    approved = risk.gate([_signal(symbol="AAA", entry=100.0, stop=90.0)],
+                         equity=10_000.0, open_positions=[], trades_today=0,
+                         reject_counts=counts, held_notional=10_000.0)
+
+    assert approved == []
+    assert counts["buying_power"] == 1
+
+
+def test_gate_skips_oversized_but_still_fits_a_smaller_candidate(monkeypatch):
+    monkeypatch.setattr(sectors, "sector_of", lambda sym: None)
+    # $9k already committed leaves $1k of headroom: the 40%-of-equity name
+    # cannot fit, but a cheap one sized under the remaining budget can.
+    big = _signal(symbol="BIG", entry=100.0, stop=90.0, score=90.0)   # $3,000
+    small = _signal(symbol="SML", entry=2.0, stop=1.0, score=80.0)     # $600
+    approved = risk.gate([big, small], equity=10_000.0, open_positions=[],
+                         trades_today=0, held_notional=9_000.0)
+
+    assert [sig.symbol for sig, _ in approved] == ["SML"]
