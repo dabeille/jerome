@@ -70,6 +70,8 @@ def _run_row(label: str, start: str, end: str, spy_bars: pd.DataFrame,
         "max_open_positions": p["max_open_positions"],
         "rsi_oversold": p["rsi_oversold"],
         "meanrev_stop_pct": p["stop_pct"],
+        "meanrev_target_min_r": p.get("target_min_r"),
+        "momentum_entry_buffer": p.get("entry_buffer"),
         "strategies": p["strategies"],
         "trades": ts.count,
         "trades_per_day": round(cs.trades_per_day, 4),
@@ -122,20 +124,72 @@ def _configs() -> list[tuple[str, str, str, dict]]:
     return runs
 
 
+def _meanrev_configs() -> list[tuple[str, str, str, dict]]:
+    """Meanrev geometry retune (Phase-1 week-1 remediation).
+
+    §4B's exit is "close above the 5-day MA", but a static bracket can only
+    freeze that MA at entry, which live produced as 0.41R/0.44R winners against
+    a 3% stop. These runs are meanrev-only so momentum's much larger P&L cannot
+    mask the effect, and they sweep the three levers that set the geometry:
+    how deep a dip we demand (rsi_oversold), how much room the stop gets
+    (stop_pct), and the take-profit floor in R (target_min_r, 0.0 = today's
+    behaviour).
+    """
+    runs = []
+    for rsi in (5.0, 10.0, 15.0):
+        for stop_pct in (0.015, 0.02, 0.03):
+            for min_r in (0.0, 1.0, 1.5, 2.0):
+                runs.append((
+                    f"mr-rsi{rsi:g}-stop{stop_pct:g}-r{min_r:g}",
+                    TRAIN_START, TRAIN_END,
+                    dict(strategies=("meanrev",), rsi_oversold=rsi,
+                         meanrev_stop_pct=stop_pct, meanrev_target_min_r=min_r),
+                ))
+    return runs
+
+
+def _entry_buffer_configs() -> list[tuple[str, str, str, dict]]:
+    """Momentum entry-buffer probe (Phase-1 week-1 remediation).
+
+    How far above the breakout close should the marketable limit sit? Too tight
+    and we keep missing the gap-and-go breakouts the strategy exists to catch;
+    too loose and we chase. Momentum-only so meanrev can't mask the effect;
+    0.0 reproduces the old at-the-close behaviour as the control.
+    """
+    return [
+        (f"eb-{b:g}", TRAIN_START, TRAIN_END,
+         dict(strategies=("momentum",), momentum_entry_buffer=b))
+        for b in (0.0, 0.0025, 0.005, 0.01, 0.02)
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start", default=TRAIN_START, help="override train start")
     parser.add_argument("--end", default=TRAIN_END,
                         help="override train end (still guarded ≤ 2023-12-31)")
     parser.add_argument("--out", default=None, help="CSV path (default data/sweep_results.csv)")
+    parser.add_argument("--meanrev", action="store_true",
+                        help="run the meanrev geometry retune grid instead of "
+                             "the staged 0.5.3 sweep")
+    parser.add_argument("--entry-buffer", action="store_true",
+                        help="run the momentum entry-buffer probe instead of "
+                             "the staged 0.5.3 sweep")
     args = parser.parse_args()
 
     _guard(args.end)  # fail fast before any run if the override crosses the boundary
 
     spy_bars = data.get_daily_bars(config.UNIVERSE, refresh=False)["SPY"]
 
+    if args.meanrev:
+        configs = _meanrev_configs()
+    elif args.entry_buffer:
+        configs = _entry_buffer_configs()
+    else:
+        configs = _configs()
+
     rows: list[dict] = []
-    for label, start, end, kwargs in _configs():
+    for label, start, end, kwargs in configs:
         # honour a global window override on the training-window stages
         if start == TRAIN_START:
             start, end = args.start, args.end
