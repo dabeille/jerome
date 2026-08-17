@@ -46,6 +46,12 @@ class Trade:
     stop: float = 0.0
     target: float = 0.0
     exit_reason: str = ""  # "stop" | "target" | "time" | "eod" | "halt"
+    # Risk per share the position was *sized* on, i.e. the signal's intended
+    # (entry - stop). R multiples are measured against this, not against the
+    # realized (fill - stop): a fill that lands just above its own stop leaves
+    # a near-zero realized denominator, which turns one trade into hundreds of
+    # R and poisons the expectancy that parameter sweeps rank on.
+    risk_per_share: float = 0.0
 
     @property
     def pnl(self) -> float:
@@ -61,6 +67,7 @@ class Position:
     stop: float
     target: float
     strategy: str
+    risk_per_share: float = 0.0  # intended risk at sizing time; see Trade
     days_held: int = 0  # trading days since entry, for the time-stop
 
 
@@ -97,8 +104,10 @@ def run_backtest(start: str, end: str, strict: bool = False,
                  starting_equity: float = STARTING_EQUITY,
                  fractional: bool = False,
                  target_r: float = momentum.TARGET_R,
+                 momentum_entry_buffer: float = momentum.ENTRY_BUFFER,
                  rsi_oversold: float = meanrev.RSI_OVERSOLD,
                  meanrev_stop_pct: float = meanrev.STOP_PCT,
+                 meanrev_target_min_r: float = meanrev.TARGET_MIN_R,
                  max_open_positions: int | None = None,
                  max_trades_per_day: int | None = None,
                  time_stop_days: int | None = None,
@@ -119,7 +128,8 @@ def run_backtest(start: str, end: str, strict: bool = False,
 
     Tuning knobs (all default to live behaviour, exercised only by 0.5.3
     sweeps): ``fractional`` allows sub-share sizing; ``target_r`` /
-    ``rsi_oversold`` / ``meanrev_stop_pct`` override the signal thresholds;
+    ``rsi_oversold`` / ``meanrev_stop_pct`` / ``meanrev_target_min_r`` /
+    ``momentum_entry_buffer`` override the signal thresholds;
     ``max_open_positions`` / ``max_trades_per_day`` override the slot caps;
     ``time_stop_days`` force-exits a position at the close once it has been
     held that many trading days without a bracket leg firing (models §4A's
@@ -188,7 +198,7 @@ def run_backtest(start: str, end: str, strict: bool = False,
                     symbol=sym, entry_date=pos.entry_date, entry=pos.entry,
                     exit_date=str(t.date()), exit=fill, qty=pos.qty,
                     strategy=pos.strategy, stop=pos.stop, target=pos.target,
-                    exit_reason=reason,
+                    exit_reason=reason, risk_per_share=pos.risk_per_share,
                 ))
                 del positions[sym]
 
@@ -228,7 +238,7 @@ def run_backtest(start: str, end: str, strict: bool = False,
                     symbol=sym, entry_date=pos.entry_date, entry=pos.entry,
                     exit_date=str(t.date()), exit=fill, qty=pos.qty,
                     strategy=pos.strategy, stop=pos.stop, target=pos.target,
-                    exit_reason="halt",
+                    exit_reason="halt", risk_per_share=pos.risk_per_share,
                 ))
                 del positions[sym]
             # Any symbol without a bar today (thin/gappy history) can't be
@@ -269,7 +279,33 @@ def run_backtest(start: str, end: str, strict: bool = False,
             if t not in df.index:
                 funnel["fill_no_bar"] += 1
                 continue
-            fill = df.loc[t, "open"] * (1 + SLIPPAGE)
+            # Model the live order: a limit at sig.entry, good for the day.
+            # It fills only if the day trades at or below that limit, and never
+            # above it. The engine used to fill every pending entry at the open
+            # unconditionally, which is why the backtest could not see the
+            # execution problem that cost half the fills in the week of
+            # 2026-08-10 — a limit priced at the prior close missed every
+            # breakout that gapped. Fills are still marked with slippage.
+            limit = p.signal.entry
+            day_open, day_low = df.loc[t, "open"], df.loc[t, "low"]
+            if day_low > limit:
+                funnel["fill_limit_missed"] += 1
+                continue
+            fill = min(day_open, limit) * (1 + SLIPPAGE)
+            if fill <= p.signal.stop:
+                # Gapped down through the stop before we were ever in. The
+                # signal's premise (entry above stop) is gone, so this is not a
+                # trade the strategy means to take — and modelling it as one
+                # produces a negative risk denominator, which is how a single
+                # row reached +15R of "expectancy" before this guard existed.
+                #
+                # NOTE: live is not this lucky. A resting GTC bracket limit
+                # *will* fill on that gap and then stop out immediately. This
+                # skip therefore understates the real cost; see the remediation
+                # plan's note on stop-entry orders, which would close the gap
+                # properly by only triggering on strength.
+                funnel["fill_gapped_through_stop"] += 1
+                continue
             cost = fill * p.qty
             if cost > cash:
                 funnel["fill_insufficient_cash"] += 1
@@ -279,6 +315,7 @@ def run_backtest(start: str, end: str, strict: bool = False,
                 symbol=sym, entry_date=str(t.date()), entry=fill,
                 qty=p.qty, stop=p.signal.stop, target=p.signal.target,
                 strategy=p.signal.strategy,
+                risk_per_share=p.signal.risk_per_share,
             )
             trades_today += 1
             funnel["filled"] += 1
@@ -288,15 +325,18 @@ def run_backtest(start: str, end: str, strict: bool = False,
         sliced = {sym: df.loc[:t] for sym, df in bars.items()}
         signals: list[Signal] = []
         if "momentum" in strategies:
-            signals += momentum.scan(sliced, target_r=target_r)
+            signals += momentum.scan(sliced, target_r=target_r,
+                                     entry_buffer=momentum_entry_buffer)
         if "meanrev" in strategies:
             signals += meanrev.scan(sliced, rsi_oversold=rsi_oversold,
-                                    stop_pct=meanrev_stop_pct)
+                                    stop_pct=meanrev_stop_pct,
+                                    target_min_r=meanrev_target_min_r)
         funnel["signals_generated"] += len(signals)
         approved = risk.gate(signals, equity, list(positions), trades_today,
                              reject_counts=funnel, fractional=fractional,
                              max_open_positions=max_open_positions,
-                             max_trades_per_day=max_trades_per_day)
+                             max_trades_per_day=max_trades_per_day,
+                             held_notional=equity - cash)
         pending = [_Pending(sig, qty) for sig, qty in approved]
 
         equity_dates.append(t)
@@ -313,7 +353,7 @@ def run_backtest(start: str, end: str, strict: bool = False,
                 symbol=sym, entry_date=pos.entry_date, entry=pos.entry,
                 exit_date=str(last.date()), exit=fill, qty=pos.qty,
                 strategy=pos.strategy, stop=pos.stop, target=pos.target,
-                exit_reason="eod",
+                exit_reason="eod", risk_per_share=pos.risk_per_share,
             ))
 
     equity_curve = pd.Series(equity_values, index=pd.DatetimeIndex(equity_dates, name="timestamp"))
@@ -331,8 +371,9 @@ def run_backtest(start: str, end: str, strict: bool = False,
         daily_loss_limit=config.DAILY_LOSS_LIMIT, drawdown_halt=config.DRAWDOWN_HALT,
         max_trades_per_day=eff_max_trades,
         relvol_mult=momentum.RELVOL_MULT, rs_top_pct=momentum.RS_TOP_PCT,
-        target_r=target_r, rsi_oversold=rsi_oversold,
-        stop_pct=meanrev_stop_pct,
+        target_r=target_r, entry_buffer=momentum_entry_buffer,
+        rsi_oversold=rsi_oversold,
+        stop_pct=meanrev_stop_pct, target_min_r=meanrev_target_min_r,
     )
     return BacktestResult(trades=trades, equity_curve=equity_curve,
                           funnel=dict(funnel), halts=halts, params=params)

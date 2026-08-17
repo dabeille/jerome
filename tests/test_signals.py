@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from bot.signals import meanrev, momentum
 
@@ -57,6 +58,33 @@ def test_momentum_breakout_signal():
     assert sig.side == "buy"
     assert sig.strategy == "momentum"
     assert sig.stop < sig.entry < sig.target
+
+
+def test_momentum_entry_is_a_marketable_limit_above_the_breakout_close():
+    """Entry priced *at* the breakout close only filled when price traded back
+    down through it — so the breakout strategy systematically bought the
+    breakouts that failed and missed the ones that ran (week of 2026-08-10:
+    1 fill in 3, and that fill had gapped down 2.67%)."""
+    spy = _bars(DATES45)
+    closes = [50.0] * 44 + [60.0]
+    volumes = [1_000_000] * 44 + [3_000_000]
+    mom = _bars(DATES45, closes, volumes)
+
+    sig = momentum.scan({"SPY": spy, "MOM": mom})[0]
+
+    assert sig.entry == pytest.approx(60.0 * (1 + momentum.ENTRY_BUFFER))
+    assert sig.entry > 60.0
+
+
+def test_momentum_entry_buffer_is_tunable():
+    spy = _bars(DATES45)
+    closes = [50.0] * 44 + [60.0]
+    volumes = [1_000_000] * 44 + [3_000_000]
+    mom = _bars(DATES45, closes, volumes)
+
+    sig = momentum.scan({"SPY": spy, "MOM": mom}, entry_buffer=0.0)[0]
+
+    assert sig.entry == pytest.approx(60.0)
 
 
 def test_momentum_no_breakout_no_signal():

@@ -17,10 +17,22 @@ TRADING_DAYS_PER_YEAR = 252
 
 
 def r_multiple(trade: Trade) -> float:
-    """(exit - entry) / (entry - stop): the trade's realized risk multiple,
-    using its own recorded stop. 0.0 if the stop distance is zero."""
-    risk = trade.entry - trade.stop
-    return (trade.exit - trade.entry) / risk if risk != 0 else 0.0
+    """The trade's realized risk multiple: P&L per share over the risk per
+    share the position was *sized* on. 0.0 if that risk is not positive.
+
+    The denominator is the signal's intended ``entry - stop`` (recorded on the
+    trade at fill time), not the realized ``fill - stop``. That distinction is
+    load-bearing: the fill can land anywhere at or below the limit, and one
+    that lands just above its own stop leaves a near-zero realized denominator
+    — a single such trade scores hundreds of R and silently poisons
+    ``expectancy_r``, which is the metric parameter sweeps rank on. It is also
+    the economically right denominator, because the intended risk is what the
+    position was sized against and what the 3%-of-equity risk budget bought.
+
+    Falls back to ``entry - stop`` for trades with no recorded intended risk,
+    and guards on ``> 0`` so a degenerate denominator can never leak through."""
+    risk = trade.risk_per_share or (trade.entry - trade.stop)
+    return (trade.exit - trade.entry) / risk if risk > 0 else 0.0
 
 
 def hold_days(trade: Trade) -> int:

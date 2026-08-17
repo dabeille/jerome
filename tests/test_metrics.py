@@ -197,3 +197,32 @@ def test_funnel_section_gate_legs_fail_when_sparse():
     text = "\n".join(lines)
     assert "Gated signals/day 0.300 vs Phase-1 gate >=1/day: FAIL" in text
     assert "Fills/week 0.50 vs Phase-1 gate >=2/week: FAIL" in text
+
+
+def test_r_multiple_uses_intended_risk_not_the_realized_fill_gap():
+    """The case that poisoned a whole parameter sweep: a fill landing just
+    above its own stop leaves a near-zero *realized* denominator, scoring one
+    trade at hundreds of R. Sizing-time risk is the stable, correct basis."""
+    from backtest.engine import Trade
+
+    # Signal intended entry 100 / stop 97 -> 3.0 of risk per share. The fill
+    # gapped down to 97.001, leaving a realized gap of 0.001.
+    t = Trade(symbol="X", entry_date="2024-01-02", entry=97.001,
+              exit_date="2024-01-03", exit=100.001, qty=1, stop=97.0,
+              risk_per_share=3.0)
+
+    assert metrics.r_multiple(t) == pytest.approx(1.0)      # 3.0 / 3.0
+    # Without the intended-risk basis this would have been ~3000.
+    assert metrics.r_multiple(t) < 2
+
+
+def test_r_multiple_is_zero_when_risk_is_degenerate():
+    from backtest.engine import Trade
+
+    no_risk = Trade(symbol="X", entry_date="2024-01-02", entry=97.0,
+                    exit_date="2024-01-03", exit=98.0, qty=1, stop=97.0)
+    inverted = Trade(symbol="X", entry_date="2024-01-02", entry=96.0,
+                     exit_date="2024-01-03", exit=97.0, qty=1, stop=97.0)
+
+    assert metrics.r_multiple(no_risk) == 0.0
+    assert metrics.r_multiple(inverted) == 0.0
