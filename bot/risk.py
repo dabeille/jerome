@@ -48,12 +48,20 @@ def gate(signals: list[Signal], equity: float,
          reject_counts: dict[str, int] | None = None,
          fractional: bool = False,
          max_open_positions: int | None = None,
-         max_trades_per_day: int | None = None) -> list[tuple[Signal, float]]:
+         max_trades_per_day: int | None = None,
+         held_notional: float = 0.0) -> list[tuple[Signal, float]]:
     """Return (signal, qty) pairs that pass all checks, best score first.
 
     ``reject_counts``, if given, is incremented in place with the reason each
     dropped signal was dropped: vetoed, already_held, size_zero, sector_cap,
-    slots_full. Default None leaves gate()'s behaviour unchanged.
+    buying_power, slots_full. Default None leaves gate()'s behaviour unchanged.
+
+    ``held_notional`` is the market value of positions already open. It is what
+    makes plan §5's "no leverage" rule real: MAX_OPEN_POSITIONS (3) ×
+    MAX_POSITION_PCT (0.40) permits 120% of equity, so without this check the
+    bot can borrow — and MAX_BUYING_POWER_MULT was declared in config and never
+    read by anything. Defaults to 0.0, which for a caller that doesn't pass it
+    still caps a single run's new exposure at 1.0x equity.
 
     ``fractional`` (backtest-only, see position_size) allows sub-share
     quantities; a signal is then only size-zero below Alpaca's $1 minimum
@@ -64,6 +72,7 @@ def gate(signals: list[Signal], equity: float,
     max_trades = config.MAX_TRADES_PER_DAY if max_trades_per_day is None else max_trades_per_day
     approved: list[tuple[Signal, float]] = []
     slots = min(max_open - len(open_positions), max_trades - trades_today)
+    budget = max(equity * config.MAX_BUYING_POWER_MULT - held_notional, 0.0)
     sector_counts: dict[str, int] = {}
     for sym in open_positions:
         sec = sectors.sector_of(sym)
@@ -99,6 +108,14 @@ def gate(signals: list[Signal], equity: float,
             if reject_counts is not None:
                 reject_counts["sector_cap"] = reject_counts.get("sector_cap", 0) + 1
             continue
+        notional = qty * sig.entry
+        if notional > budget:
+            # Skip rather than break: a smaller candidate further down the
+            # ranking may still fit inside the remaining budget.
+            if reject_counts is not None:
+                reject_counts["buying_power"] = reject_counts.get("buying_power", 0) + 1
+            continue
+        budget -= notional
         approved.append((sig, qty))
         if sec:
             sector_counts[sec] = sector_counts.get(sec, 0) + 1

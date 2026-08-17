@@ -7,7 +7,7 @@ dashboard.md regenerated after each run.
 import html
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from bot import config
 
@@ -62,6 +62,42 @@ def log_order(symbol: str, side: str, qty: int, order_type: str,
             (_now(), symbol, side, qty, order_type, status,
              broker_order_id, fill_price),
         )
+
+
+def update_order(broker_order_id: str, status: str,
+                 fill_price: float = 0) -> int:
+    """Update a previously-logged order with its terminal status and fill
+    price. Returns the number of rows changed (0 if we never logged it — e.g.
+    a bracket child leg, or an order placed by hand in the Alpaca UI).
+
+    Called by broker.reconcile_orders() at the close. Without it the orders
+    table keeps only submission-time state and no fills, which is why the
+    first week of paper trading produced no measurable slippage data."""
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE orders SET status = ?, fill_price = ? "
+            "WHERE broker_order_id = ?",
+            (status, fill_price, broker_order_id),
+        )
+        return cur.rowcount
+
+
+def naked_history(symbol: str, within_days: int = 30) -> tuple[int, str]:
+    """(runs, first_ts) for NAKED-POSITION rows naming ``symbol`` in the last
+    ``within_days``. Feeds the alert's "unprotected since" line.
+
+    Deliberately a simple window rather than true streak detection: a position
+    cannot be reported naked before it is opened, so within a 30-day window the
+    earliest row is the start of the current episode in every realistic case.
+    Returns (0, "") if the symbol has never been reported."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=within_days)).isoformat()
+    with _conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*), MIN(ts) FROM decisions "
+            "WHERE action = 'NAKED-POSITION' AND ts >= ? AND symbol = ?",
+            (cutoff, symbol),
+        ).fetchone()
+    return (row[0], row[1] or "") if row else (0, "")
 
 
 def log_equity(equity: float, cash: float, note: str = "") -> None:
@@ -143,6 +179,19 @@ def recent_decisions(action: str, limit: int = 5) -> list[tuple[str, str, str]]:
             (action, limit),
         ).fetchall()
     return rows
+
+
+def last_entry_levels(symbol: str) -> tuple[float, float]:
+    """(stop, target) from the most recent 'entered' decision for ``symbol``,
+    or (0, 0) if we never logged one. Used by ``bot.main reattach-stops`` to
+    re-arm a position at the levels its original bracket carried."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT stop, target FROM decisions WHERE action = 'entered' "
+            "AND symbol = ? ORDER BY ts DESC LIMIT 1",
+            (symbol,),
+        ).fetchone()
+    return (row[0], row[1]) if row else (0.0, 0.0)
 
 
 def equity_at_day_start(date_utc: str) -> float:

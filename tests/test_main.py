@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from bot import config, journal, main
+from bot import alerts, config, journal, main
 
 
 class Recorder:
@@ -41,7 +41,14 @@ def _fake_broker(monkeypatch, *, trading_day=True, drawdown=False,
         positions_without_stops=lambda: (naked or []),
         flatten_all=lambda reason: calls["flatten"].append(reason),
         submit_bracket=lambda sig, qty: "order-1",
-        client=lambda: SimpleNamespace(get_all_positions=lambda: []),
+        held_notional=lambda: 0.0,
+        cancel_stale_entries=lambda: [],
+        reconcile_orders=lambda: 0,
+        client=lambda: SimpleNamespace(get_all_positions=lambda: [
+            SimpleNamespace(symbol=sym, qty="10", avg_entry_price="100",
+                            market_value="1000", unrealized_pl="0")
+            for sym in (naked or [])
+        ]),
     )
     fake_risk = SimpleNamespace(
         kill_switch_active=lambda: False,
@@ -58,7 +65,11 @@ def _fake_broker(monkeypatch, *, trading_day=True, drawdown=False,
     monkeypatch.setattr(main, "broker", fake_broker)
     monkeypatch.setattr(main, "risk", fake_risk)
     monkeypatch.setattr(main, "data", fake_data)
-    monkeypatch.setattr(main, "alerts", SimpleNamespace(alert=lambda *a, **k: True))
+    monkeypatch.setattr(main, "alerts", SimpleNamespace(
+        alert=lambda *a, **k: True,
+        naked_position=alerts.naked_position,
+        crashed=alerts.crashed,
+    ))
     monkeypatch.setattr(config, "validate", lambda: None)
     monkeypatch.setattr(config, "MODE", "paper")
     return fake_broker, fake_risk, calls
@@ -143,19 +154,108 @@ def test_naked_position_alerts_and_journals(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
     alerted = []
     _fake_broker(monkeypatch, naked=["AAPL"])
-    monkeypatch.setattr(main, "alerts",
-                        SimpleNamespace(alert=lambda subj, body="": alerted.append(subj)))
+    monkeypatch.setattr(main, "alerts", SimpleNamespace(
+        alert=lambda subj, body="": alerted.append((subj, body)),
+        naked_position=alerts.naked_position,
+        crashed=alerts.crashed,
+    ))
     monkeypatch.setattr(main, "_write_dashboard", lambda session: None)
     main.run("close")  # close session reaches the naked check then snapshots
-    assert alerted and "NAKED POSITION" in alerted[0]
+    subject, body = alerted[0]
+    assert "UNPROTECTED" in subject
+    assert "$1,000" in subject          # exposure, not just the ticker
+    assert "AAPL" in body and "WHAT TO DO NOW" in body
     assert len(journal.recent_decisions("NAKED-POSITION")) == 1
 
 
 def test_run_with_alerts_pages_on_crash(monkeypatch):
     alerted = []
-    monkeypatch.setattr(main, "alerts",
-                        SimpleNamespace(alert=lambda subj, body="": alerted.append(subj)))
+    monkeypatch.setattr(main, "alerts", SimpleNamespace(
+        alert=lambda subj, body="": alerted.append((subj, body)),
+        naked_position=alerts.naked_position,
+        crashed=alerts.crashed,
+    ))
     monkeypatch.setattr(main, "run", lambda session: (_ for _ in ()).throw(RuntimeError("boom")))
     with pytest.raises(RuntimeError, match="boom"):
         main._run_with_alerts("morning")
-    assert alerted and "CRASHED" in alerted[0]
+    subject, body = alerted[0]
+    assert "CRASH" in subject
+    assert "boom" in body
+
+
+# ---------------------------------------------------------------------------
+# reattach-stops (remediation path the UNPROTECTED alert points at)
+# ---------------------------------------------------------------------------
+
+
+def test_reattach_stops_is_blocked_by_the_kill_switch(monkeypatch, tmp_path):
+    """Re-arming places live orders, so KILL must win over it."""
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    fake_broker, _, calls = _fake_broker(monkeypatch, naked=["AAPL"])
+    attached = []
+    fake_broker.attach_exit_oco = lambda *a: attached.append(a)
+    monkeypatch.setattr(main.risk, "kill_switch_active", lambda: True)
+
+    main.run("reattach-stops")
+
+    assert attached == []
+    assert calls["flatten"] == ["kill switch"]
+
+
+def test_reattach_stops_uses_journalled_entry_levels(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    fake_broker, _, _ = _fake_broker(monkeypatch, naked=["AAPL"])
+    attached = []
+    fake_broker.attach_exit_oco = lambda *a: (attached.append(a) or "oco-1")
+    journal.log_decision("morning", "AAPL", "meanrev", "entered",
+                         entry=100.0, stop=97.0, target=103.0, qty=10)
+
+    main.run("reattach-stops")
+
+    assert attached == [("AAPL", 10.0, 97.0, 103.0)]
+    assert len(journal.recent_decisions("STOPS-REATTACHED")) == 1
+
+
+def test_reattach_stops_skips_positions_with_no_journalled_levels(monkeypatch, tmp_path):
+    """Never invent a stop for a position of unknown provenance."""
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    fake_broker, _, _ = _fake_broker(monkeypatch, naked=["AAPL"])
+    attached = []
+    fake_broker.attach_exit_oco = lambda *a: attached.append(a)
+
+    main.run("reattach-stops")
+
+    assert attached == []
+
+
+def test_close_run_cancels_stale_entries_and_reconciles(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    fake_broker, _, _ = _fake_broker(monkeypatch)
+    seen = {"cancelled": False, "reconciled": False}
+    fake_broker.cancel_stale_entries = lambda: (
+        seen.__setitem__("cancelled", True) or ["AAPL"])
+    fake_broker.reconcile_orders = lambda: (
+        seen.__setitem__("reconciled", True) or 1)
+    monkeypatch.setattr(main, "_write_dashboard", lambda session: None)
+
+    main.run("close")
+
+    assert seen == {"cancelled": True, "reconciled": True}
+    assert len(journal.recent_decisions("STALE-ENTRY-CANCELLED")) == 1
+
+
+def test_morning_run_sweeps_entries_left_over_from_a_missed_close(monkeypatch, tmp_path):
+    """GTC entries must not survive to fill days later at a stale price."""
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    fake_broker, _, _ = _fake_broker(monkeypatch)
+    order = []
+    fake_broker.cancel_stale_entries = lambda: (order.append("swept") or [])
+    fake_broker.submit_bracket = lambda sig, qty: (order.append("submitted") or "o1")
+    monkeypatch.setattr(main, "_write_dashboard", lambda session: None)
+    monkeypatch.setattr(main.data, "get_daily_bars", lambda *a, **k: {})
+    monkeypatch.setattr(main.llm_analyst, "review", lambda s, h, e: s)
+
+    main.run("morning")
+
+    # Swept before anything this session could place.
+    assert order[:1] == ["swept"]

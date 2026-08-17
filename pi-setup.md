@@ -404,9 +404,17 @@ count and spot, and a second run of the same command prints `skip` (idempotent).
   flattens and halts. Recovery is deliberately manual: review the journal, then
   `.venv/bin/python -m bot.main resume` and type `RESUME` (cron can never trip
   this). It rebases the high-water mark to current equity.
+- **Unprotected positions & re-arming:** an `UNPROTECTED` alert means an open
+  position has no live broker-side stop. Either flatten (`touch KILL`) or
+  re-arm with `.venv/bin/python -m bot.main reattach-stops`, which attaches a
+  GTC stop/target OCO at the levels from that position's original entry. A
+  position with no journalled entry levels is reported, not guessed at — re-arm
+  that one by hand in the Alpaca UI.
 - **Alerts mean act; silence means fine.** The heartbeat guarantees silence is
   real — if the morning run dies, you get paged by 10:00 ET. Watch for
-  `NAKED POSITION` and `CRASHED` subjects especially.
+  `UNPROTECTED` and `CRASH` subjects especially. Alert subjects lead with the
+  dollars at stake; a `[STILL UNPROTECTED — run N]` prefix means you have
+  already been told N times.
 - **Daily glance:** open the LAN dashboard. Equity curve, open positions, the
   last funnel row (how many signals surfaced vs. filled), recent decisions.
 - **Log hygiene:** `data/cron.log` grows slowly; rotate occasionally

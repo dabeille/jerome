@@ -37,6 +37,13 @@ def run(session: str) -> None:
     if config.MODE == "backtest":
         sys.exit("Use backtest/run.py for backtests, not bot.main")
 
+    # Re-arming places live orders, so it sits behind the kill switch and the
+    # backtest guard — but ahead of the trading-day check, because the whole
+    # point is to get stops back on before the market opens again.
+    if session == "reattach-stops":
+        _reattach_stops()
+        return
+
     # 2. Trading-day check — after the kill switch (which must always run), but
     # before any trading work. Uses the broker calendar, not get_clock(): the
     # 9:00 run fires before the 9:30 open on perfectly good days.
@@ -65,8 +72,23 @@ def run(session: str) -> None:
     _check_naked_positions(session)
 
     if session == "close":
+        # Brackets are GTC so the exit legs survive the night; the entry limits
+        # must not. Retire today's unfilled entries, then write the day's fills
+        # back to the journal so slippage is measurable (plan §1.2.3).
+        stale = broker.cancel_stale_entries()
+        if stale:
+            journal.log_decision(session, ",".join(stale), "risk",
+                                 "STALE-ENTRY-CANCELLED",
+                                 reasoning="unfilled GTC entry retired at close")
+        broker.reconcile_orders()
         _write_dashboard(session)
         return  # exits are bracket-managed broker-side; close run = snapshot
+
+    # Insurance against a missed close run: retire any entry still resting from
+    # a previous session before this one prices new ones. Runs before signals so
+    # it can never touch an order this session is about to place.
+    if session == "morning":
+        broker.cancel_stale_entries()
 
     # 5. Signals — modules selected by config.ENABLED_STRATEGIES, so a
     # strategy can be benched (or a redesign swapped in) via .env alone.
@@ -91,7 +113,8 @@ def run(session: str) -> None:
     reject_counts: dict[str, int] = {}
     proposals = risk.gate(signals, equity, broker.open_position_symbols(),
                           trades_today=broker.entries_today(),
-                          reject_counts=reject_counts)
+                          reject_counts=reject_counts,
+                          held_notional=broker.held_notional())
 
     # 8. Approval gate (Phase 2 only), then execute.
     if config.MODE == "approve":
@@ -148,19 +171,62 @@ def _resume() -> None:
     print("Resumed — high-water mark rebased to current equity.")
 
 
+def _reattach_stops() -> None:
+    """Re-arm broker-side exits on positions that have none.
+
+    The remediation the naked-position alert points at. Levels come from the
+    position's original 'entered' decision, so a re-armed position carries the
+    stop and target the risk gate actually sized it for. A position we have no
+    journal record of is reported, not guessed at — inventing a stop for a
+    position of unknown provenance is how you turn a monitoring problem into a
+    trading one."""
+    naked = broker.positions_without_stops()
+    if not naked:
+        print("All open positions already have a live broker-side stop.")
+        return
+
+    by_symbol = {p.symbol: p for p in broker.client().get_all_positions()}
+    for sym in naked:
+        pos = by_symbol.get(sym)
+        if pos is None:
+            continue
+        stop, target = journal.last_entry_levels(sym)
+        if stop <= 0 or target <= 0:
+            print(f"  {sym}: no journalled entry levels — re-arm by hand "
+                  f"(qty {pos.qty} @ {pos.avg_entry_price}).")
+            continue
+        order_id = broker.attach_exit_oco(sym, float(pos.qty), stop, target)
+        journal.log_decision("reattach-stops", sym, "risk", "STOPS-REATTACHED",
+                             stop=stop, target=target,
+                             reasoning=f"OCO {order_id} attached to open position")
+        print(f"  {sym}: stop {stop:.2f} / target {target:.2f} attached ({order_id})")
+
+
 def _check_naked_positions(session: str) -> None:
     """Every session: page if any open position lacks a live broker-side stop
     (plan §5). Alert-only — a false positive that auto-liquidated would be
-    worse than a loud page you clear with one `touch KILL`."""
+    worse than a loud page you clear with one `touch KILL`.
+
+    One journal row per symbol (not one comma-joined row): the alert needs
+    per-symbol history to say how long each has been exposed."""
     naked = broker.positions_without_stops()
     if not naked:
         return
-    joined = ", ".join(naked)
-    journal.log_decision(session, ",".join(naked), "risk", "NAKED-POSITION",
-                         reasoning="open position(s) without a live stop")
-    alerts.alert(f"bot {session}: NAKED POSITION — {joined}",
-                 f"Open without a live broker-side stop: {joined}. "
-                 f"Review now; `touch KILL` to flatten everything.")
+
+    for sym in naked:
+        journal.log_decision(session, sym, "risk", "NAKED-POSITION",
+                             reasoning="open position without a live stop")
+
+    by_symbol = {p.symbol: p for p in broker.client().get_all_positions()}
+    rows = [
+        (sym,
+         float(by_symbol[sym].qty),
+         float(by_symbol[sym].avg_entry_price),
+         float(by_symbol[sym].market_value))
+        for sym in naked if sym in by_symbol
+    ]
+    history = {sym: journal.naked_history(sym) for sym in naked}
+    alerts.alert(*alerts.naked_position(rows, broker.equity(), history))
 
 
 def _write_dashboard(session: str) -> None:
@@ -190,7 +256,7 @@ def _run_with_alerts(session: str) -> None:
     try:
         run(session)
     except Exception:
-        alerts.alert(f"bot {session} CRASHED", traceback.format_exc()[-1500:])
+        alerts.alert(*alerts.crashed(session, traceback.format_exc()[-1500:]))
         raise
 
 
