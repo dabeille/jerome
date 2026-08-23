@@ -420,7 +420,115 @@ count and spot, and a second run of the same command prints `skip` (idempotent).
 - **Log hygiene:** `data/cron.log` grows slowly; rotate occasionally
   (`: > data/cron.log` after archiving, or add a `logrotate` rule).
 
-## 12. Weekly review (plan 1.2.3)
+## 12. Updating the Pi
+
+Every code change reaches the Pi by hand — there is no deploy pipeline, and the
+bot deliberately never updates itself (an auto-updated dependency during market
+hours is its own risk). The failure mode that matters here is silent: a Pi still
+running last month's code produces a perfectly clean-looking week of evidence
+about the wrong software. The week-1 review opened by proving the Pi had
+actually pulled, because nothing in the journal says so on its own.
+
+### When
+
+**Weekends and holidays.** The three sessions and the heartbeat only fire
+Mon–Fri, so a Saturday update collides with nothing; Sunday collides only with
+the 08:00 ET universe refresh. Update mid-week and you get one session on the
+old code and the next on the new one, with no marker in the journal saying
+which — or a run that starts mid-pull and imports a half-updated tree.
+
+If you must update on a weekday, do it **between** sessions (roughly 10:15–12:15
+or 13:00–15:30 ET), never inside one, and check nothing is running first.
+
+### Update
+
+```bash
+ssh pi@jerome.local
+cd /home/pi/jerome
+
+# 1. Nothing may be mid-run. Both of these must come back empty.
+pgrep -af 'bot\.main|scripts\.' ; ls run/
+
+# 2. Local state should be clean. data/, .env and KILL are gitignored, so
+#    anything listed here is an edit made on the Pi and forgotten about.
+git status --short
+
+# 3. See what you are about to take, then take it.
+git fetch origin && git log --oneline HEAD..origin/main
+git pull --ff-only origin main
+
+# 4. Dependencies — only if requirements.txt moved in that range.
+git diff --name-only HEAD@{1} HEAD -- requirements.txt
+.venv/bin/pip install -r requirements.txt        # only if the line above printed
+
+# 5. New settings. .env is gitignored and a pull never touches it, so diff the
+#    variable names against the example and add anything new by hand.
+diff <(grep -oE '^[A-Z_]+' .env.example | sort) <(grep -oE '^[A-Z_]+' .env | sort)
+```
+
+Step 5 is not bookkeeping. `ENABLED_STRATEGIES=meanrev` — the setting that
+benched momentum for the entire Phase-1 window — arrived as a line in
+`.env.example` that had to be copied across by hand. A pull cannot add it, the
+bot does not warn when it is missing, and the default quietly runs both
+strategies instead.
+
+### Verify
+
+```bash
+# The code is what you think it is, and it imports.
+git log -1 --format='%h %ad %s' --date=iso
+.venv/bin/python -c "import bot.main, bot.broker, bot.risk, bot.journal; print('imports OK')"
+.venv/bin/python -c "from bot import config; config.validate()"
+
+# Read-only broker check — exercises the live API path without placing anything.
+.venv/bin/python -c "from bot import broker; print('buying power', broker.available_buying_power())"
+```
+
+The full suite is the strongest check available, and it is offline and pure
+Python — one extra package, no wheels to build:
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt    # once; pytest only
+.venv/bin/python -m pytest -q
+```
+
+**Do not use `scripts.smoke_test` as a post-update check.** It places a real
+(far-from-market, immediately cancelled) SPY order, which lands in the account's
+order history and then shows up as a phantom entry in the next weekly Alpaca
+pull. It is a first-install tool, not a deploy check.
+
+**The dashboard needs nothing.** `bot-dashboard` serves static files and runs no
+bot code; the next session re-renders `data/public/dashboard.html`.
+
+### Confirm it actually took
+
+`git` says what is on disk. Only the journal says what *ran*. After the first
+session on the new code, check the funnel row carries whatever the change was
+supposed to add:
+
+```bash
+sqlite3 data/journal.db "select ts,run,payload from funnel order by ts desc limit 3"
+```
+
+For the 2026-08-23 update that means `vetoed_earnings` / `vetoed_llm` appearing
+on a run that had vetoes, and `llm_failed` staying absent. Until a real run
+shows it, treat the deploy as unverified.
+
+### Rolling back
+
+```bash
+git log --oneline -5
+git reset --hard <sha>          # the previous known-good commit
+touch KILL                      # if you are rolling back because it traded wrong
+```
+
+Two things `git reset` will not undo: a `.env` edit from step 5, and anything
+already written to `journal.db`. **Never delete or truncate the journal** to get
+back to a clean state — per plan §1.1.6 an empty journal makes both the −6% and
+−20% breakers return `False`, silently disarming them. That is a much worse
+failure than the one being rolled back.
+
+## 13. Weekly review (plan 1.2.3)
 
 Once a week, spend ten minutes on:
 
@@ -433,7 +541,7 @@ Once a week, spend ten minutes on:
 - **Running tally toward the Phase-2 gate** — expectancy and drawdown over the
   live sample.
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -448,9 +556,10 @@ Once a week, spend ten minutes on:
 | A session produced no output at all in `cron.log` | `flock` skipped it because a previous run still holds `run/bot.lock`. `ls -l run/`, then `pgrep -af bot.main`. With `timeout` in place this self-clears within 15 min; if it doesn't, kill the process by hand and `touch KILL`. |
 | Silence, but you're not sure it's healthy | the 10:00 heartbeat only proves the **morning** run journaled equity. A midday/close run that never fired is not alerted on. `sqlite3 data/journal.db "select ts,note from equity order by ts desc limit 5"`. |
 | `ZoneInfo('America/New_York')` errors | `sudo apt install tzdata`. |
+| A week of evidence looks clean but doesn't match the code you shipped | the Pi never pulled. `ssh pi@jerome.local 'cd jerome && git log -1'` — compare against `main`. Nothing in the journal records which commit ran, so check this *first*, before reading any of the week's numbers (section 12). |
 | Chain snapshot: `no cached bars for X` | run `scripts.fetch_history` first (section 6). |
 
-## 14. Phase-1 start
+## 15. Phase-1 start
 
 When sections 1–10 all check out and cron is installed:
 
@@ -458,5 +567,5 @@ When sections 1–10 all check out and cron is installed:
    4-week Phase-2 evaluation clock.
 2. Let it run. Resist the urge to tinker mid-week; the point of Phase 1 is an
    honest live sample to compare against the backtest.
-3. Do the weekly review (section 12). The month-1 product is the *journal*:
+3. Do the weekly review (section 13). The month-1 product is the *journal*:
    evidence about which signals actually pay.

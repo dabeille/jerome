@@ -6,6 +6,9 @@ assert, monkeypatch.setattr instead of unittest.mock.
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 from bot import config
@@ -140,3 +143,74 @@ def test_wellformed_verdict_still_applies_alongside_a_malformed_one(monkeypatch)
     assert bad.vetoed is False   # skipped, left alone
     assert good.vetoed is True   # still reviewed
     assert good.veto_reason == "earnings"
+
+
+# ---------------------------------------------------------------------------
+# Observability: which layer vetoed, and whether the LLM ran at all
+# ---------------------------------------------------------------------------
+
+
+def test_earnings_veto_records_its_source():
+    sig = _signal(symbol="AAPL")
+    llm_analyst.review([sig], {}, {"AAPL"})
+    assert sig.veto_source == "earnings"
+
+
+def test_llm_veto_records_its_source(monkeypatch):
+    """Plan §9 asks whether the analyst has ever vetoed anything. Both layers
+    set `vetoed`, and the funnel only ever carried a merged count, so two weeks
+    of data could not answer it. The source is now on the signal."""
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "dummy-key")
+    monkeypatch.setattr(
+        llm_analyst, "_ask_llm",
+        lambda c, h: {"XYZ": {"veto": True, "reason": "FDA decision",
+                              "score_adjust": 0}},
+    )
+    sig = _signal()
+    llm_analyst.review([sig], {}, set())
+    assert sig.veto_source == "llm"
+
+
+def test_fail_open_is_recorded_in_status(monkeypatch):
+    """A fail-open that leaves no trace outside cron.log is not observable:
+    three truncated calls in the week of 2026-08-17 switched the veto layer off
+    without a single journalled row saying so."""
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "dummy-key")
+
+    def _raise(candidates, headlines):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(llm_analyst, "_ask_llm", _raise)
+    status: dict = {}
+    llm_analyst.review([_signal()], {}, set(), status=status)
+    assert status == {"llm_failed": 1}
+
+
+def test_successful_review_leaves_status_clean(monkeypatch):
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "dummy-key")
+    monkeypatch.setattr(
+        llm_analyst, "_ask_llm",
+        lambda c, h: {"XYZ": {"veto": False, "reason": "", "score_adjust": 0}},
+    )
+    status: dict = {}
+    llm_analyst.review([_signal()], {}, set(), status=status)
+    assert status == {}
+
+
+def test_truncated_verdict_names_max_tokens_not_a_parse_error(monkeypatch):
+    """The real failure read `Unterminated string starting at: line 1 column
+    2491`, which names neither the cap nor the cause. At 19 candidates a 1024
+    token ceiling cuts the verdict object mid-string every time."""
+    monkeypatch.setattr(config, "ANTHROPIC_API_KEY", "dummy-key")
+    monkeypatch.setattr(config, "LLM_MAX_TOKENS", 1024)
+
+    truncated = '{"XYZ": {"veto": false, "reason": "still tal'
+    fake_client = SimpleNamespace(messages=SimpleNamespace(
+        create=lambda **kw: SimpleNamespace(
+            stop_reason="max_tokens",
+            content=[SimpleNamespace(text=truncated)])))
+    monkeypatch.setitem(sys.modules, "anthropic",
+                        SimpleNamespace(Anthropic=lambda api_key: fake_client))
+
+    with pytest.raises(ValueError, match="max_tokens=1024"):
+        llm_analyst._ask_llm([_signal()], {})

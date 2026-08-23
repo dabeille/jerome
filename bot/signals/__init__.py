@@ -15,6 +15,7 @@ class Signal:
     reasoning: str = ""
     vetoed: bool = False
     veto_reason: str = ""
+    veto_source: str = ""   # "earnings" (deterministic) | "llm" — see §9
 
     @property
     def risk_per_share(self) -> float:

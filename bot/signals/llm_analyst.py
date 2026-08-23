@@ -12,16 +12,22 @@ from bot.signals import Signal
 
 
 def review(signals: list[Signal], headlines: dict[str, list[str]],
-           earnings_soon: set[str]) -> list[Signal]:
+           earnings_soon: set[str],
+           status: dict | None = None) -> list[Signal]:
     """Apply cheap deterministic vetoes first, then (optionally) the LLM.
 
     headlines: symbol -> recent headline strings
     earnings_soon: symbols reporting within the hold horizon
+    status: if given, gets ``llm_failed: 1`` when the LLM call fails. This layer
+        is documented to fail open, which in the week of 2026-08-17 meant three
+        truncated calls left no trace outside cron.log; the funnel should record
+        that the veto layer was not running.
     """
     for s in signals:
         if s.symbol in earnings_soon:
             s.vetoed = True
             s.veto_reason = "earnings within hold window"
+            s.veto_source = "earnings"
 
     if not config.ANTHROPIC_API_KEY:
         return signals  # deterministic vetoes only; LLM layer disabled
@@ -44,6 +50,8 @@ def review(signals: list[Signal], headlines: dict[str, list[str]],
         _apply(candidates, verdicts)
     except Exception as exc:  # fail-open — never block trading on an LLM hiccup
         print(f"LLM analyst call failed, skipping review: {exc}")
+        if status is not None:
+            status["llm_failed"] = 1
     return signals
 
 
@@ -101,6 +109,14 @@ def _ask_llm(candidates: list[Signal], headlines: dict[str, list[str]]) -> dict[
         max_tokens=config.LLM_MAX_TOKENS,
         messages=[{"role": "user", "content": _build_prompt(candidates, headlines)}],
     )
+    if response.stop_reason == "max_tokens":
+        # A truncated verdict fails json.loads with an opaque "Unterminated
+        # string" pointing deep into the parse, which is what three runs in the
+        # week of 2026-08-17 reported. Name the real cause instead.
+        raise ValueError(
+            f"verdict truncated at max_tokens={config.LLM_MAX_TOKENS} with "
+            f"{len(candidates)} candidates — raise config.LLM_MAX_TOKENS"
+        )
     text = response.content[0].text.strip()
     return json.loads(text)
 
@@ -118,6 +134,7 @@ def _apply(candidates: list[Signal], verdicts: dict[str, dict]) -> None:
         if verdict.get("veto"):
             s.vetoed = True
             s.veto_reason = verdict.get("reason", "")
+            s.veto_source = "llm"
         else:
             try:
                 adjust = max(-20, min(20, int(verdict.get("score_adjust", 0))))

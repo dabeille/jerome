@@ -355,3 +355,36 @@ def test_gate_skips_oversized_but_still_fits_a_smaller_candidate(monkeypatch):
                          trades_today=0, held_notional=9_000.0)
 
     assert [sig.symbol for sig, _ in approved] == ["SML"]
+
+
+def test_gate_budget_is_capped_by_the_brokers_buying_power(monkeypatch):
+    """A resting GTC entry reserves cash without being a position, so the
+    equity-derived budget overstates what is spendable. On 2026-08-21 that gap
+    approved an order the account could not fund and the session died on a 403.
+    """
+    monkeypatch.setattr(sectors, "sector_of", lambda sym: None)
+    counts: dict[str, int] = {}
+    # $10k equity, nothing held -> policy budget is the full $10k, but the
+    # broker will only fund $500 because an earlier entry is still resting.
+    approved = risk.gate([_signal(symbol="AAA", entry=100.0, stop=90.0)],
+                         equity=10_000.0, open_positions=[], trades_today=0,
+                         reject_counts=counts, held_notional=0.0,
+                         buying_power=500.0)
+
+    assert approved == []
+    assert counts["buying_power"] == 1
+
+
+def test_gate_will_not_spend_margin_the_broker_offers(monkeypatch):
+    """MAX_BUYING_POWER_MULT is a policy cap, not a restatement of the broker's
+    number. Alpaca hands this account multiplier=4 and shorting_enabled; taking
+    the tighter of the two must never let that through."""
+    monkeypatch.setattr(sectors, "sector_of", lambda sym: None)
+    counts: dict[str, int] = {}
+    approved = risk.gate([_signal(symbol="AAA", entry=100.0, stop=90.0)],
+                         equity=10_000.0, open_positions=[], trades_today=0,
+                         reject_counts=counts, held_notional=10_000.0,
+                         buying_power=40_000.0)
+
+    assert approved == []
+    assert counts["buying_power"] == 1

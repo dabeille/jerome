@@ -49,6 +49,11 @@ class FakeClient:
         self.canceled = False
         self.closed_all = False
         self.canceled_ids = []
+        self.account = SimpleNamespace(equity="10000", cash="4000",
+                                       buying_power="4000")
+
+    def get_account(self):
+        return self.account
 
     def get_orders(self, filter=None):
         out = self._orders
@@ -265,3 +270,67 @@ def test_flatten_all_cancels_closes_and_journals(fake, tmp_path, monkeypatch):
     with journal._conn() as c:
         row = c.execute("SELECT symbol, order_type FROM orders").fetchone()
     assert row == ("*", "liquidate_all")
+
+
+# ---------------------------------------------------------------------------
+# buying power, and the cancel/reconcile ordering hazard
+# ---------------------------------------------------------------------------
+
+
+def test_available_buying_power_reads_the_broker_not_equity(fake):
+    """`equity - held_notional` is not what the account can spend: an unfilled
+    GTC entry reserves buying power without ever becoming a position."""
+    fake.account = SimpleNamespace(equity="1000", cash="583.49",
+                                   buying_power="223.88")
+    assert broker.available_buying_power() == pytest.approx(223.88)
+
+
+def test_cancel_stale_entries_journals_the_cancellation(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    sig = Signal(symbol="XLI", side="buy", score=84.4, entry=179.77,
+                 stop=177.07, target=185.16, strategy="meanrev")
+    broker.submit_bracket(sig, qty=2)          # journals the submission status
+    fake._orders = [_order("XLI", OrderSide.BUY, OrderStatus.NEW,
+                           order_id="order-xyz")]
+
+    assert broker.cancel_stale_entries() == ["XLI"]
+
+    with journal._conn() as c:
+        assert c.execute("SELECT status FROM orders").fetchone() == ("canceled",)
+
+
+def test_reconcile_does_not_regress_a_cancelled_row_to_a_live_status(
+        fake, tmp_path, monkeypatch):
+    """XLI on 2026-08-21: the close run cancelled the entry and reconciled
+    seconds later, before Alpaca had moved it out of `new`. The journal recorded
+    the live status and the cancellation never landed anywhere."""
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    sig = Signal(symbol="XLI", side="buy", score=84.4, entry=179.77,
+                 stop=177.07, target=185.16, strategy="meanrev")
+    broker.submit_bracket(sig, qty=2)
+    # The broker still reports the order as live — the cancel has not propagated.
+    fake._orders = [_order("XLI", OrderSide.BUY, OrderStatus.NEW,
+                           order_id="order-xyz")]
+
+    broker.cancel_stale_entries()
+    broker.reconcile_orders()
+
+    with journal._conn() as c:
+        assert c.execute("SELECT status FROM orders").fetchone() == ("canceled",)
+
+
+def test_reconcile_still_records_a_partial_fill(fake, tmp_path, monkeypatch):
+    """The live-status skip must not swallow partially_filled, which is a live
+    state that nonetheless carries real fill data."""
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    sig = Signal(symbol="KRE", side="buy", score=77.1, entry=74.61,
+                 stop=73.49, target=76.84, strategy="meanrev")
+    broker.submit_bracket(sig, qty=5)
+    fake._orders = [_order("KRE", OrderSide.BUY, OrderStatus.PARTIALLY_FILLED,
+                           order_id="order-xyz", filled_qty=3,
+                           filled_avg_price="74.60")]
+
+    assert broker.reconcile_orders() == 1
+    with journal._conn() as c:
+        row = c.execute("SELECT status, fill_price FROM orders").fetchone()
+    assert row == ("partially_filled", 74.60)

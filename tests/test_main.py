@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from bot import alerts, config, journal, main
+from bot.signals import Signal
 
 
 class Recorder:
@@ -42,6 +43,7 @@ def _fake_broker(monkeypatch, *, trading_day=True, drawdown=False,
         flatten_all=lambda reason: calls["flatten"].append(reason),
         submit_bracket=lambda sig, qty: "order-1",
         held_notional=lambda: 0.0,
+        available_buying_power=lambda: 10000.0,
         cancel_stale_entries=lambda: [],
         reconcile_orders=lambda: 0,
         client=lambda: SimpleNamespace(get_all_positions=lambda: [
@@ -111,7 +113,8 @@ def test_happy_path_threads_entries_today_and_journals_funnel(monkeypatch, tmp_p
         earnings_within=lambda syms: set()))
     monkeypatch.setattr(main.momentum, "scan", lambda bars: [])
     monkeypatch.setattr(main.meanrev, "scan", lambda bars: [])
-    monkeypatch.setattr(main.llm_analyst, "review", lambda s, h, e: s)
+    monkeypatch.setattr(main.llm_analyst, "review",
+                        lambda s, h, e, status=None: s)
     monkeypatch.setattr(main, "_write_dashboard", lambda session: None)
 
     main.run("morning")
@@ -139,7 +142,8 @@ def test_enabled_strategies_benches_meanrev(monkeypatch, tmp_path):
                         lambda bars: scanned.append("momentum") or [])
     monkeypatch.setattr(main.meanrev, "scan", lambda bars: (_ for _ in ()).throw(
         AssertionError("meanrev is benched and must not be scanned")))
-    monkeypatch.setattr(main.llm_analyst, "review", lambda s, h, e: s)
+    monkeypatch.setattr(main.llm_analyst, "review",
+                        lambda s, h, e, status=None: s)
     monkeypatch.setattr(main, "_write_dashboard", lambda session: None)
     monkeypatch.setattr(config, "ENABLED_STRATEGIES", ("momentum",))
 
@@ -253,9 +257,104 @@ def test_morning_run_sweeps_entries_left_over_from_a_missed_close(monkeypatch, t
     fake_broker.submit_bracket = lambda sig, qty: (order.append("submitted") or "o1")
     monkeypatch.setattr(main, "_write_dashboard", lambda session: None)
     monkeypatch.setattr(main.data, "get_daily_bars", lambda *a, **k: {})
-    monkeypatch.setattr(main.llm_analyst, "review", lambda s, h, e: s)
+    monkeypatch.setattr(main.llm_analyst, "review",
+                        lambda s, h, e, status=None: s)
 
     main.run("morning")
 
     # Swept before anything this session could place.
     assert order[:1] == ["swept"]
+
+
+def _signals_path(monkeypatch, scan=None):
+    """Wire the collaborators the signals half of run() needs."""
+    monkeypatch.setattr(main, "data", SimpleNamespace(
+        get_daily_bars=lambda *a, **k: {},
+        get_headlines=lambda syms: {},
+        earnings_within=lambda syms: set()))
+    monkeypatch.setattr(main.momentum, "scan", lambda bars: [])
+    monkeypatch.setattr(main.meanrev, "scan", scan or (lambda bars: []))
+    monkeypatch.setattr(main, "_write_dashboard", lambda session: None)
+
+
+def test_a_rejected_order_costs_the_signal_not_the_session(monkeypatch, tmp_path):
+    """2026-08-21 midday: a 403 from submit_bracket propagated out of run(), so
+    the session never wrote its funnel row, never ran the naked-position check
+    and never rendered the dashboard. One unfundable order took out every guard
+    downstream of it."""
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    fake_broker, fake_risk, _ = _fake_broker(monkeypatch)
+    alerted = []
+    monkeypatch.setattr(main, "alerts", SimpleNamespace(
+        alert=lambda subj, body="": alerted.append(subj),
+        naked_position=alerts.naked_position, crashed=alerts.crashed))
+    _signals_path(monkeypatch)
+    monkeypatch.setattr(main.llm_analyst, "review",
+                        lambda s, h, e, status=None: s)
+
+    sig = Signal(symbol="XLI", side="buy", score=84.4, entry=179.77,
+                 stop=177.07, target=185.16, strategy="meanrev")
+    fake_risk.gate = lambda *a, **k: [(sig, 2)]
+
+    def _refuse(sig, qty):
+        raise RuntimeError("insufficient buying power")
+
+    fake_broker.submit_bracket = _refuse
+
+    main.run("morning")            # must not raise
+
+    _, _, payload = journal.last_funnel()      # the run got all the way here
+    assert payload["order_rejected"] == 1
+    assert payload["entered"] == 0
+    rows = journal.recent_decisions("ORDER-REJECTED")
+    assert len(rows) == 1 and rows[0][1] == "XLI"
+    assert "insufficient buying power" in rows[0][2]
+    assert any("rejected by the broker" in s for s in alerted)
+
+
+def test_vetoed_signals_are_journalled_with_their_source(monkeypatch, tmp_path):
+    """A veto was the one decision that never reached the journal: candidates
+    are logged before review, and the gate then drops a vetoed signal without a
+    row of its own (plan §9)."""
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    _fake_broker(monkeypatch)
+    sig = Signal(symbol="DE", side="buy", score=60.0, entry=100.0, stop=98.5,
+                 target=103.0, strategy="meanrev")
+    _signals_path(monkeypatch, scan=lambda bars: [sig])
+
+    def _veto(signals, headlines, earnings, status=None):
+        signals[0].vetoed = True
+        signals[0].veto_reason = "earnings within hold window"
+        signals[0].veto_source = "earnings"
+        return signals
+
+    monkeypatch.setattr(main.llm_analyst, "review", _veto)
+
+    main.run("morning")
+
+    rows = journal.recent_decisions("vetoed")
+    assert len(rows) == 1
+    assert rows[0][1] == "DE"
+    assert rows[0][2].startswith("earnings: ")
+    _, _, payload = journal.last_funnel()
+    assert payload["vetoed_earnings"] == 1
+
+
+def test_an_llm_failure_reaches_the_funnel(monkeypatch, tmp_path):
+    """The layer is documented to fail open. Without a funnel key, three
+    truncated calls existed nowhere but cron.log."""
+    monkeypatch.setattr(config, "JOURNAL_DB", tmp_path / "journal.db")
+    _fake_broker(monkeypatch)
+    _signals_path(monkeypatch)
+
+    def _fail_open(signals, headlines, earnings, status=None):
+        if status is not None:
+            status["llm_failed"] = 1
+        return signals
+
+    monkeypatch.setattr(main.llm_analyst, "review", _fail_open)
+
+    main.run("morning")
+
+    _, _, payload = journal.last_funnel()
+    assert payload["llm_failed"] == 1
