@@ -43,7 +43,12 @@ ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "")
 # setup; swap for your own verified domain later if you want nicer From lines.
 ALERT_EMAIL_FROM = os.getenv("ALERT_EMAIL_FROM", "onboarding@resend.dev")
 LLM_MODEL = "claude-opus-4-8"   # analyst veto/conviction call (plan §4C)
-LLM_MAX_TOKENS = 1024           # small JSON verdict object, one call/run
+# One call per run, returning a verdict object keyed by symbol. 1024 was sized
+# for the 2-4 candidates of early Phase 1; the week of 2026-08-17 scanned up to
+# 19 at once, the response truncated mid-string on three runs, json.loads raised
+# and the veto layer failed open in silence. Sized now for a full-universe scan
+# (~60 candidates x ~130 chars of verdict) with headroom.
+LLM_MAX_TOKENS = 4096
 
 # --- Risk constants (see plan §5) -------------------------------------------
 RISK_PER_TRADE = 0.03        # fraction of equity risked per trade

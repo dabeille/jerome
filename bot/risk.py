@@ -49,7 +49,8 @@ def gate(signals: list[Signal], equity: float,
          fractional: bool = False,
          max_open_positions: int | None = None,
          max_trades_per_day: int | None = None,
-         held_notional: float = 0.0) -> list[tuple[Signal, float]]:
+         held_notional: float = 0.0,
+         buying_power: float | None = None) -> list[tuple[Signal, float]]:
     """Return (signal, qty) pairs that pass all checks, best score first.
 
     ``reject_counts``, if given, is incremented in place with the reason each
@@ -63,6 +64,13 @@ def gate(signals: list[Signal], equity: float,
     read by anything. Defaults to 0.0, which for a caller that doesn't pass it
     still caps a single run's new exposure at 1.0x equity.
 
+    ``buying_power`` is what the broker will actually fund. It is not the same
+    quantity: an unfilled GTC entry reserves buying power while contributing
+    nothing to ``held_notional``, so the equity-derived budget runs ahead of
+    reality for as long as an entry rests. On 2026-08-21 that gap approved an
+    order the account could not pay for and the session died on a 403. None
+    (backtest) keeps the equity-derived budget alone.
+
     ``fractional`` (backtest-only, see position_size) allows sub-share
     quantities; a signal is then only size-zero below Alpaca's $1 minimum
     notional. ``max_open_positions`` / ``max_trades_per_day`` override the
@@ -73,6 +81,12 @@ def gate(signals: list[Signal], equity: float,
     approved: list[tuple[Signal, float]] = []
     slots = min(max_open - len(open_positions), max_trades - trades_today)
     budget = max(equity * config.MAX_BUYING_POWER_MULT - held_notional, 0.0)
+    if buying_power is not None:
+        # Policy cap vs. what the broker will fund — take the tighter. Only the
+        # policy half survives on a margin account (where buying_power can be
+        # several times equity); only the broker half survives when resting
+        # entries have reserved cash the equity figure cannot see.
+        budget = min(budget, max(buying_power, 0.0))
     sector_counts: dict[str, int] = {}
     for sym in open_positions:
         sec = sectors.sector_of(sym)

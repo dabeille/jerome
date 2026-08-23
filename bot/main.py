@@ -103,10 +103,26 @@ def run(session: str) -> None:
                              s.score, s.entry, s.stop, s.target,
                              reasoning=s.reasoning)
 
-    # 6. LLM analyst review (veto layer).
+    # 6. LLM analyst review (veto layer). `llm_status` carries a fail-open back
+    # into the funnel — the layer degrades silently by design, so without this
+    # its three truncated calls in the week of 2026-08-17 existed nowhere but
+    # cron.log.
+    llm_status: dict[str, int] = {}
     syms = [s.symbol for s in signals]
     signals = llm_analyst.review(signals, data.get_headlines(syms),
-                                 data.earnings_within(syms))
+                                 data.earnings_within(syms), status=llm_status)
+
+    # A veto was the one decision that never reached the journal: candidates are
+    # logged above, *before* review, and a vetoed signal is then dropped by the
+    # gate without a row of its own. Only a bare count survived, in the funnel,
+    # which is why plan §9 ("has the analyst ever vetoed anything?") could not be
+    # answered from two weeks of data. Log the symbol and which layer vetoed it.
+    for s in signals:
+        if s.vetoed:
+            journal.log_decision(session, s.symbol, s.strategy, "vetoed",
+                                 s.score, s.entry, s.stop, s.target,
+                                 reasoning=f"{s.veto_source or 'unknown'}: "
+                                           f"{s.veto_reason}")
 
     # 7. Risk gate — trades_today from real broker orders (plan 1.1.5), and
     # reject_counts captured so the live funnel matches the backtest's shape.
@@ -114,26 +130,68 @@ def run(session: str) -> None:
     proposals = risk.gate(signals, equity, broker.open_position_symbols(),
                           trades_today=broker.entries_today(),
                           reject_counts=reject_counts,
-                          held_notional=broker.held_notional())
+                          held_notional=broker.held_notional(),
+                          buying_power=broker.available_buying_power())
 
     # 8. Approval gate (Phase 2 only), then execute.
     if config.MODE == "approve":
         proposals = approve.request_approval(proposals)
     entered = 0
+    rejected = 0
     for sig, qty in proposals:
-        order_id = broker.submit_bracket(sig, qty)
+        # A broker rejection costs us this signal, never the session. On
+        # 2026-08-21 midday a 403 here killed the run outright, so it never
+        # wrote its funnel row, never ran the naked-position check and never
+        # rendered the dashboard: one unfundable order took out every guard
+        # downstream of it.
+        try:
+            order_id = broker.submit_bracket(sig, qty)
+        except Exception as exc:
+            rejected += 1
+            journal.log_decision(session, sig.symbol, sig.strategy,
+                                 "ORDER-REJECTED", sig.score, sig.entry,
+                                 sig.stop, sig.target, qty,
+                                 reasoning=str(exc)[:400])
+            print(f"order rejected for {sig.symbol}: {exc}", file=sys.stderr)
+            continue
         entered += 1
         journal.log_decision(session, sig.symbol, sig.strategy, "entered",
                              sig.score, sig.entry, sig.stop, sig.target,
                              qty, f"order {order_id}")
 
+    if rejected:
+        # The gate now sizes against the broker's own buying power, so a
+        # rejection means gate and broker disagree about what is affordable.
+        # Rare by construction, and silence would hide a bot that has quietly
+        # stopped trading.
+        alerts.alert(
+            f"[JEROME] {rejected} order(s) rejected by the broker — {session}",
+            f"The risk gate approved {len(proposals)} order(s) and the broker "
+            f"refused {rejected} of them.\n\n"
+            f"The session completed normally and no open position is exposed "
+            f"by this — every existing bracket is untouched. What did not "
+            f"happen is the intended entry.\n\n"
+            f"The broker's reason is on the ORDER-REJECTED rows in journal.db:\n"
+            f"  sqlite3 data/journal.db \"select ts,symbol,reasoning from "
+            f"decisions where action='ORDER-REJECTED' order by ts desc limit 5\"",
+        )
+
     # 9. Live signal funnel (plan 1.1.5) — one row per run, comparable to the
     # backtest funnel: signals in == entered + approval-skipped + all drops.
+    veto_sources: dict[str, int] = {}
+    for s in signals:
+        if s.vetoed:
+            key = f"vetoed_{s.veto_source or 'unknown'}"
+            veto_sources[key] = veto_sources.get(key, 0) + 1
+
     journal.log_funnel(session, {
         "strategies": list(config.ENABLED_STRATEGIES),
         "signals_generated": len(signals),
         "approved": len(proposals),
         "entered": entered,
+        **({"order_rejected": rejected} if rejected else {}),
+        **veto_sources,
+        **llm_status,
         **reject_counts,
     })
 

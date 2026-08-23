@@ -94,6 +94,16 @@ def held_notional() -> float:
     return sum(float(p.market_value) for p in client().get_all_positions())
 
 
+def available_buying_power() -> float:
+    """What the broker will actually fund right now.
+
+    Deliberately distinct from ``equity - held_notional``: an unfilled GTC entry
+    reserves buying power without ever becoming a position, so the equity-derived
+    figure overstates what is spendable for as long as an entry rests. Feeds
+    risk.gate's budget — see the 2026-08-21 403."""
+    return float(account().buying_power)
+
+
 def submit_bracket(sig: Signal, qty: int) -> str:
     """Entry + stop-loss + take-profit as one unit. The account is never in a
     position without a live broker-side stop (plan §5).
@@ -153,11 +163,15 @@ def cancel_stale_entries() -> list[str]:
             continue
         if float(o.filled_qty or 0) > 0:
             continue
-        # No journal write here on purpose: reconcile_orders() runs immediately
-        # after in the close session and stamps the original bracket row with
-        # its real terminal status. Logging a second row under the same
-        # broker_order_id would just give reconciliation two rows to update.
+        # Stamp the journal here rather than leaving it to reconcile_orders().
+        # That runs seconds later in the same close session, before Alpaca has
+        # moved the order out of `new` — so it wrote a *live* status back and
+        # the cancellation never landed at all (ARM 08-18 and XLI 08-21 both
+        # read `new` in the journal against `canceled` at the broker). We are
+        # the actor and cancel_order_by_id raises if the cancel is refused, so
+        # the outcome is known here and needs no propagation delay.
         client().cancel_order_by_id(o.id)
+        journal.update_order(str(o.id), "canceled")
         cancelled.append(o.symbol)
     return cancelled
 
@@ -177,6 +191,11 @@ def reconcile_orders() -> int:
     )
     updated = 0
     for o in orders:
+        if o.status in _LIVE_ORDER_STATES and not float(o.filled_qty or 0):
+            # Still working and nothing filled: there is no terminal state to
+            # record, and writing the live status back would regress a row that
+            # cancel_stale_entries() has already stamped `canceled`.
+            continue
         updated += journal.update_order(
             str(o.id), _status_str(o.status), float(o.filled_avg_price or 0)
         )
