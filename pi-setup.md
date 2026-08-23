@@ -348,6 +348,16 @@ Two details that are load-bearing, not style:
   local process can pre-create `/tmp/bot.lock` with permissions `pi` can't
   open, and every run then fails silently. A repo-local path also survives
   reboots consistently.
+- **The lock files are permanent, and `run/` is meant to hold four of them**
+  (`bot`, `hb`, `chain`, `uni` — one per `flock` line above). `flock` locks the
+  open file *descriptor*, not the path, and the kernel drops that lock when the
+  process exits; the file it locked stays behind at zero bytes. So a lock file
+  sitting there tells you nothing, and **deleting one is worse than leaving
+  it**: remove `run/bot.lock` while a session holds it and the next run creates
+  a fresh file at the same path, locks a different inode, and runs *concurrently
+  with the one still going* — precisely what the lock exists to prevent. To ask
+  whether a lock is actually held, try to take it:
+  `flock -n run/bot.lock true && echo free`.
 
 What each line does:
 
@@ -446,8 +456,9 @@ or 13:00–15:30 ET), never inside one, and check nothing is running first.
 ssh pi@jerome.local
 cd /home/pi/jerome
 
-# 1. Nothing may be mid-run. Both of these must come back empty.
-pgrep -af 'bot\.main|scripts\.' ; ls run/
+# 1. Nothing may be mid-run. Neither line may print anything.
+pgrep -af 'bot\.main|scripts\.'
+for l in run/*.lock; do flock -n "$l" true || echo "HELD: $l"; done
 
 # 2. Local state should be clean. data/, .env and KILL are gitignored, so
 #    anything listed here is an edit made on the Pi and forgotten about.
@@ -553,7 +564,7 @@ Once a week, spend ten minutes on:
 | Dashboard unreachable from laptop | ufw rule subnet wrong (`ufw status`), or `bot-dashboard` not running (`systemctl status bot-dashboard`). |
 | `curl …/journal.db` returns 200 | the server is exposing too much — `--directory` is missing, relative, or wrong. Must be the absolute `/home/pi/jerome/data/public`. Fix immediately. |
 | Dashboard 403s or the unit won't start after the sandbox change | a `ProtectSystem=strict` path violation. `journalctl -u bot-dashboard -n 50` names the path; add it to `ReadOnlyPaths` only if it's genuinely needed. |
-| A session produced no output at all in `cron.log` | `flock` skipped it because a previous run still holds `run/bot.lock`. `ls -l run/`, then `pgrep -af bot.main`. With `timeout` in place this self-clears within 15 min; if it doesn't, kill the process by hand and `touch KILL`. |
+| A session produced no output at all in `cron.log` | `flock` skipped it because a previous run still holds `run/bot.lock`. Test the lock (`flock -n run/bot.lock true && echo free`) and find the holder (`pgrep -af bot.main`) — the *presence* of the file proves nothing, it is permanent. With `timeout` in place this self-clears within 15 min; if it doesn't, kill the process by hand and `touch KILL`. |
 | Silence, but you're not sure it's healthy | the 10:00 heartbeat only proves the **morning** run journaled equity. A midday/close run that never fired is not alerted on. `sqlite3 data/journal.db "select ts,note from equity order by ts desc limit 5"`. |
 | `ZoneInfo('America/New_York')` errors | `sudo apt install tzdata`. |
 | A week of evidence looks clean but doesn't match the code you shipped | the Pi never pulled. `ssh pi@jerome.local 'cd jerome && git log -1'` — compare against `main`. Nothing in the journal records which commit ran, so check this *first*, before reading any of the week's numbers (section 12). |
